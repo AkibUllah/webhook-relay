@@ -1,0 +1,44 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+psycopg://relay:relay@db:5432/relay
+      API_KEY: ${API_KEY:-change-me}
+      WORKER_ENABLED: "false"     # the worker service below does the delivering
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "webhook_relay.worker"]
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+psycopg://relay:relay@db:5432/relay
+      POLL_INTERVAL_SECONDS: "2"
+      BATCH_SIZE: "100"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    volumes:
+      - relay-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  relay-pgdata:
