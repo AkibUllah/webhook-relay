@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webhook-relay"
+version = "0.1.0"
+description = "Reliable webhook delivery service: fan-out, signed requests, exponential backoff, circuit breakers, dead letters and replay"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Akib Jafor" }]
+requires-python = ">=3.10"
+keywords = ["webhooks", "fastapi", "retry", "backoff", "circuit-breaker", "dead-letter", "at-least-once"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Framework :: FastAPI",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+  "fastapi>=0.110,<1.0",
+  "uvicorn[standard]>=0.27",
+  "sqlalchemy>=2.0,<3.0",
+  "pydantic>=2.5,<3.0",
+  "pydantic-settings>=2.1",
+  "httpx>=0.26",
+  "jinja2>=3.1",
+  "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=4.1",
+  "ruff>=0.3",
+]
+
+[project.scripts]
+webhook-relay-worker = "webhook_relay.worker:main"
+
+[tool.setuptools.packages.find]
+include = ["webhook_relay*"]
+
+[tool.setuptools.package-data]
+webhook_relay = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+  "error::DeprecationWarning:webhook_relay.*",
+  "ignore:Using `httpx` with `starlette.testclient`",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["webhook_relay"]
