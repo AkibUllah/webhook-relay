@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="10">
+  <title>webhook-relay status</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 0; padding: 24px; max-width: 1200px; margin-inline: auto; }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    .muted { color: #777; font-size: .9rem; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0; }
+    .card { border: 1px solid #8884; border-radius: 8px; padding: 12px; }
+    .card b { display: block; font-size: 1.5rem; }
+    table { width: 100%; border-collapse: collapse; font-size: .9rem; margin-bottom: 28px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #8883; vertical-align: top; }
+    code { font-size: .85em; }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: .78rem; border: 1px solid transparent; }
+    .closed, .succeeded { background: #1f8a4c22; border-color: #1f8a4c; }
+    .open, .dead { background: #c0392b22; border-color: #c0392b; }
+    .half_open, .pending, .delivering { background: #d4891122; border-color: #d48911; }
+    .inactive { opacity: .55; }
+  </style>
+</head>
+<body>
+  <h1>webhook-relay <span class="muted">v{{ version }}</span></h1>
+  <div class="muted">
+    Worker {{ "running" if metrics.worker.running else "stopped" }} ·
+    retry schedule {{ schedule }} · max {{ max_attempts }} attempts · refreshes every 10s
+  </div>
+
+  <div class="cards">
+    <div class="card"><span class="muted">Events</span><b>{{ metrics.events_total }}</b></div>
+    <div class="card"><span class="muted">Pending</span><b>{{ metrics.deliveries_by_status.pending }}</b></div>
+    <div class="card"><span class="muted">Succeeded</span><b>{{ metrics.deliveries_by_status.succeeded }}</b></div>
+    <div class="card"><span class="muted">Dead letters</span><b>{{ metrics.dead_letters }}</b></div>
+    <div class="card"><span class="muted">Success rate</span><b>{{ (metrics.success_rate * 100) | round(1) }}%</b></div>
+    <div class="card"><span class="muted">Circuits open</span><b>{{ metrics.endpoints_circuit_open }}</b></div>
+  </div>
+
+  <h2>Endpoints</h2>
+  <table>
+    <thead><tr><th>ID</th><th>URL</th><th>Filters</th><th>Circuit</th><th>Failures</th><th>Active</th></tr></thead>
+    <tbody>
+    {% for ep in endpoints %}
+      <tr class="{{ '' if ep.is_active else 'inactive' }}">
+        <td><code>{{ ep.id }}</code></td>
+        <td>{{ ep.url }}<br><span class="muted">{{ ep.description or "" }}</span></td>
+        <td>{% if ep.event_types %}{{ ep.event_types | join(", ") }}{% else %}<span class="muted">all events</span>{% endif %}</td>
+        <td><span class="tag {{ ep.circuit_state }}">{{ ep.circuit_state }}</span></td>
+        <td>{{ ep.consecutive_failures }}</td>
+        <td>{{ "yes" if ep.is_active else "no" }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No endpoints registered. POST /v1/endpoints to add one.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Recent deliveries</h2>
+  <table>
+    <thead><tr><th>Delivery</th><th>Event</th><th>Endpoint</th><th>Status</th><th>Attempts</th><th>Last result</th><th>Next attempt</th></tr></thead>
+    <tbody>
+    {% for d in deliveries %}
+      <tr>
+        <td><code>{{ d.id }}</code></td>
+        <td>{{ d.event.type }}<br><code class="muted">{{ d.event_id }}</code></td>
+        <td>{{ d.endpoint.url }}</td>
+        <td><span class="tag {{ d.status }}">{{ d.status }}</span>{% if d.replay_count %} <span class="muted">replayed ×{{ d.replay_count }}</span>{% endif %}</td>
+        <td>{{ d.attempt_count }}</td>
+        <td>{{ d.last_status_code or "" }} {{ d.last_error or "" }}</td>
+        <td>{{ d.next_attempt_at.strftime("%Y-%m-%d %H:%M:%S") if d.next_attempt_at else "" }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="muted">No deliveries yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</body>
+</html>
