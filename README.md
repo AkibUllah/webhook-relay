@@ -1,3 +1,4 @@
+<!-- topics: fastapi,python,webhooks,reliability,retry,circuit-breaker,hmac,event-driven,sqlalchemy -->
 # webhook-relay
 
 A reliable webhook delivery service: publish an event once, and it is fanned out to every subscribed endpoint with HMAC signatures, exponential backoff, per-endpoint circuit breakers, dead-letter handling and one-click replay.
