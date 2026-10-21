@@ -6,7 +6,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, Request
@@ -19,6 +21,7 @@ from webhook_relay.api import deliveries, endpoints, events, ops
 from webhook_relay.config import Settings, get_settings
 from webhook_relay.database import init_db, make_engine, make_session_factory
 from webhook_relay.logging_config import configure_logging
+from webhook_relay.models import utc_now
 from webhook_relay.services.dispatcher import Dispatcher
 from webhook_relay.services.errors import ServiceError
 
@@ -26,14 +29,19 @@ logger = logging.getLogger("webhook_relay")
 
 
 def create_app(
-    settings: Settings | None = None, *, transport: httpx.AsyncBaseTransport | None = None
+    settings: Settings | None = None,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    clock: Callable[[], datetime] = utc_now,
 ) -> FastAPI:
+    """Build the application. `clock` is the single time source shared by the API and the
+    dispatcher, so deliveries created over HTTP and claimed by the worker agree on "now"."""
     settings = settings or get_settings()
     configure_logging(settings.log_level)
 
     engine = make_engine(settings.database_url)
     session_factory = make_session_factory(engine)
-    dispatcher = Dispatcher(session_factory, settings, transport=transport)
+    dispatcher = Dispatcher(session_factory, settings, transport=transport, clock=clock)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -60,6 +68,7 @@ def create_app(
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.dispatcher = dispatcher
+    app.state.clock = clock
 
     @app.exception_handler(ServiceError)
     async def _service_error(_: Request, exc: ServiceError) -> JSONResponse:

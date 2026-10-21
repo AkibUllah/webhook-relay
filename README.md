@@ -103,7 +103,9 @@ Verify a delivery on the receiving side:
 from webhook_relay.core.signing import verify_signature, SignatureError
 
 try:
-    verify_signature(secret, request.body, request.headers["X-Relay-Signature"], tolerance_seconds=300)
+    verify_signature(
+        secret, request.body, request.headers["X-Relay-Signature"], tolerance_seconds=300
+    )
 except SignatureError:
     return 400
 ```

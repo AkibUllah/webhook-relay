@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from sqlalchemy.orm import Session
 
 from webhook_relay.api.deps import get_db, get_delivery_service, require_api_key
@@ -49,10 +49,11 @@ def get_delivery(
 )
 def replay_delivery(
     delivery_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     service: DeliveryService = Depends(get_delivery_service),
 ) -> DeliveryOut:
-    delivery = service.replay(delivery_id)
+    delivery = service.replay(delivery_id, now=request.app.state.clock())
     db.commit()
     return DeliveryOut.from_model(delivery)
 

@@ -75,9 +75,7 @@ def clock() -> Clock:
 
 @pytest.fixture
 def app(settings, target, clock):
-    application = create_app(settings, transport=httpx.MockTransport(target.handler))
-    application.state.dispatcher._clock = clock
-    return application
+    return create_app(settings, transport=httpx.MockTransport(target.handler), clock=clock)
 
 
 @pytest.fixture

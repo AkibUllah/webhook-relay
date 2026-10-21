@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -25,10 +25,11 @@ router = APIRouter(
 )
 def publish_event(
     payload: EventPublish,
+    request: Request,
     db: Session = Depends(get_db),
     service: EventService = Depends(get_event_service),
 ) -> JSONResponse:
-    event, duplicate = service.publish(payload)
+    event, duplicate = service.publish(payload, now=request.app.state.clock())
     db.commit()
     body = EventOut.from_model(event, duplicate=duplicate).model_dump(mode="json")
     return JSONResponse(body, status_code=200 if duplicate else 201)
