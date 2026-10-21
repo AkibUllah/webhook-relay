@@ -8,6 +8,15 @@ A reliable webhook delivery service: publish an event once, and it is fanned out
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Try it live
+
+| | |
+|---|---|
+| API reference | https://akibullah.github.io/webhook-relay/ — Swagger UI built from the exported OpenAPI document (static; no backend behind it) |
+| Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/webhook-relay?quickstart=1) — starts API + worker + PostgreSQL with `docker compose` and seeds one endpoint and one event; open forwarded port 8000 at `/dashboard` (admin key `change-me` for `/v1/*`). |
+| One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/webhook-relay) — `render.yaml` provisions the web service (worker in-process) and a free PostgreSQL; `API_KEY` is generated, read it from the service's environment tab. |
+| Local | `docker compose up` (see Quick Start) |
+
 ## Why this exists
 
 Every payment and e-commerce platform I have worked on had to tell other systems that something happened: a bKash payment was captured, an order shipped, a KYC applicant was approved. The first version is always a `requests.post` in the request handler, and it breaks the first time the receiver is down for a deploy. Then retries get bolted on, then someone asks "did merchant X receive event Y, and can we send it again?", and nobody can answer. This service is that answer extracted into one place: durable deliveries with an attempt history, a retry schedule that backs off sensibly, a breaker that stops hammering a dead endpoint, and a dashboard that shows what is stuck.

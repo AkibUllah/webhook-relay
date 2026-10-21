@@ -25,3 +25,6 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
+
+# Codespaces demo seed marker
+.demo-seeded

@@ -1,0 +1,32 @@
+# Render blueprint: API with the in-process delivery worker plus a managed PostgreSQL.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: webhook-relay
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: WORKER_ENABLED
+        value: "true"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: webhook-relay-db
+          property: connectionString
+      - key: API_KEY
+        generateValue: true
+
+databases:
+  - name: webhook-relay-db
+    plan: free
+    databaseName: relay
+    user: relay

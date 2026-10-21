@@ -2,7 +2,7 @@
 VENV ?= .venv
 PY := $(VENV)/bin/python
 
-.PHONY: help venv install dev worker test cov lint fmt docker-up docker-down clean
+.PHONY: help venv install dev worker test cov lint fmt openapi docker-up docker-down clean
 
 help: ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -33,6 +33,9 @@ lint: ## Ruff check + format check
 fmt: ## Format + autofix
 	$(VENV)/bin/ruff format webhook_relay tests
 	$(VENV)/bin/ruff check --fix webhook_relay tests
+
+openapi: ## Export the OpenAPI document to openapi.json
+	$(PY) scripts/export_openapi.py
 
 docker-up: ## api + worker + postgres
 	docker compose up --build -d
