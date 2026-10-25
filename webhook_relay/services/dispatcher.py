@@ -1,8 +1,13 @@
 """The delivery worker.
 
 `run_once(now)` picks due deliveries, sends them, records attempts and schedules retries.
-`run_forever()` loops with a poll interval. Everything time-related goes through `clock`
-so tests can drive the schedule deterministically, and the HTTP transport is injectable.
+`run_forever()` loops with a poll interval. Claiming is safe to run from several worker
+replicas against one PostgreSQL database: due rows are locked with `FOR UPDATE SKIP LOCKED`,
+so concurrent workers receive disjoint batches, and every claim carries a lease so work held
+by a crashed worker is picked up again once the lease expires.
+
+Everything time-related goes through `clock` so tests can drive the schedule
+deterministically, and the HTTP transport is injectable.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from webhook_relay.config import Settings
@@ -45,6 +50,8 @@ class WorkerStats:
     failed: int = 0
     dead_lettered: int = 0
     skipped_circuit_open: int = 0
+    reclaimed: int = 0
+    worker_id: str | None = None
     running: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -59,6 +66,8 @@ class WorkerStats:
             "failed": self.failed,
             "dead_lettered": self.dead_lettered,
             "skipped_circuit_open": self.skipped_circuit_open,
+            "reclaimed": self.reclaimed,
+            "worker_id": self.worker_id,
         }
 
 
@@ -103,7 +112,7 @@ class Dispatcher:
         self._transport = transport
         self._clock = clock
         self._rng = rng
-        self.stats = WorkerStats()
+        self.stats = WorkerStats(worker_id=settings.worker_id)
         self._stop = asyncio.Event()
 
     # -- public ------------------------------------------------------------------
@@ -153,20 +162,30 @@ class Dispatcher:
             return len(due)
 
     # -- internals ---------------------------------------------------------------
-    def _claim_due(self, db: Session, now: datetime) -> list[Delivery]:
-        stmt = (
+    def claim_statement(self, now: datetime) -> Select[tuple[Delivery]]:
+        """Due work: pending deliveries whose time has come, plus deliveries still marked
+        `delivering` whose claim lease has expired (their worker died mid-batch).
+
+        `FOR UPDATE OF deliveries SKIP LOCKED` makes concurrent claimers on PostgreSQL skip
+        rows another transaction has already locked instead of blocking on them or claiming
+        them twice. SQLite has no row locks (it serialises writers), so SQLAlchemy omits the
+        clause there and the status/lease check alone keeps a single process consistent.
+        """
+        due = and_(Delivery.status == "pending", Delivery.next_attempt_at <= now)
+        abandoned = and_(Delivery.status == "delivering", Delivery.claimed_until < now)
+        return (
             select(Delivery)
             .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
             .options(selectinload(Delivery.event), selectinload(Delivery.endpoint))
-            .where(
-                Delivery.status == "pending",
-                Delivery.next_attempt_at <= now,
-                Endpoint.is_active.is_(True),
-            )
+            .where(or_(due, abandoned), Endpoint.is_active.is_(True))
             .order_by(Delivery.next_attempt_at)
             .limit(self.settings.batch_size)
+            .with_for_update(skip_locked=True, of=Delivery)
         )
-        due = list(db.scalars(stmt).all())
+
+    def _claim_due(self, db: Session, now: datetime) -> list[Delivery]:
+        due = list(db.scalars(self.claim_statement(now)).all())
+        lease = timedelta(seconds=self.settings.lease_seconds)
         cooldown = timedelta(seconds=self.settings.circuit_cooldown_seconds)
         claimed: list[Delivery] = []
         for delivery in due:
@@ -179,7 +198,19 @@ class Dispatcher:
                 delivery.next_attempt_at = now + timedelta(seconds=retry_after)
                 self.stats.skipped_circuit_open += 1
                 continue
+            if delivery.status == "delivering":
+                # The previous owner's lease ran out before it recorded an outcome. The send
+                # may or may not have happened, so this is a redelivery (at-least-once).
+                self.stats.reclaimed += 1
+                logger.warning(
+                    "reclaiming %s from %s (lease expired %s)",
+                    delivery.id,
+                    delivery.claimed_by,
+                    as_utc(delivery.claimed_until).isoformat() if delivery.claimed_until else "?",
+                )
             delivery.status = "delivering"
+            delivery.claimed_by = self.settings.worker_id
+            delivery.claimed_until = now + lease
             claimed.append(delivery)
         db.commit()
         return claimed
@@ -232,6 +263,8 @@ class Dispatcher:
             )
         )
         delivery.attempt_count = attempt_number
+        delivery.claimed_by = None
+        delivery.claimed_until = None
         delivery.last_status_code = status_code
         delivery.last_error = error
         self.stats.dispatched += 1

@@ -30,6 +30,7 @@ Every payment and e-commerce platform I have worked on had to tell other systems
 - Per-endpoint circuit breaker: opens after N consecutive failures, blocks sends for a cooldown, half-open probe, auto-close on success, manual reset endpoint; `410 Gone` deactivates the endpoint
 - At-least-once semantics with full attempt history (status code, response excerpt, error, latency) and replay of any delivery, including succeeded ones
 - Worker runs inside the API process (asyncio task) or as a separate process via `python -m webhook_relay.worker`, with graceful shutdown
+- Horizontally scalable workers on PostgreSQL: due rows are claimed with `FOR UPDATE SKIP LOCKED`, so replicas get disjoint batches, and each claim carries a lease (`claimed_by` / `claimed_until`) so deliveries held by a crashed worker are picked up again automatically
 - Dead-letter list, delivery filtering by status/endpoint/event, `X-Total-Count` pagination headers
 - `/health`, `/metrics` (JSON counters: deliveries by status, success rate, open circuits, worker stats) and a server-rendered `/dashboard`
 - Admin API key, structured error envelope, SQLite for dev/tests and PostgreSQL via docker compose
@@ -58,6 +59,7 @@ flowchart LR
 Design notes:
 
 - **Deliveries are rows, not tasks.** A delivery is created in the same transaction as the event, so a crash after `201 Created` cannot lose a notification. The worker simply queries `status='pending' AND next_attempt_at <= now`.
+- **Claims are leased, not owned forever.** Claiming locks due rows with `FOR UPDATE OF deliveries SKIP LOCKED`; concurrent workers skip rows another transaction holds instead of waiting or double-sending. Each claimed delivery records the worker id and a lease deadline (by default long enough for a whole batch to time out). If a worker is killed mid-batch, its `delivering` rows become due again when the lease expires, are counted as `reclaimed` in `/metrics`, and are redelivered, which is consistent with at-least-once semantics.
 - **Time is injected.** The dispatcher takes a `clock`; tests advance it to walk through the whole retry schedule and the circuit cooldown without sleeping.
 - **The breaker is per endpoint and pure.** `core.circuit.Circuit` is an immutable value object; the dispatcher reads it from the endpoint row, applies success/failure, writes it back. Blocked deliveries stay pending with `next_attempt_at` pushed to the cooldown boundary so the loop does not spin.
 - **Signatures cover the timestamp.** The signed string is `"<t>.<body>"`, and receivers check `t` against a tolerance window, so a captured request cannot be replayed later.
@@ -169,6 +171,27 @@ webhook_relay/
 tests/                    # 25 tests; MockTransport targets, injected clock
 ```
 
+## Scaling workers
+
+Run as many worker processes as you need against the same PostgreSQL database:
+
+```bash
+docker compose up -d --scale worker=3
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WORKER_ID` | `<hostname>-<pid>` | Recorded on each claimed delivery as `claimed_by` |
+| `CLAIM_LEASE_SECONDS` | `BATCH_SIZE × HTTP_TIMEOUT_SECONDS + 60` | How long a claim is reserved before another worker may take it over |
+
+Upgrading an existing database from 0.1 (tables are created with `create_all`, which does not alter existing tables):
+
+```sql
+ALTER TABLE deliveries ADD COLUMN claimed_by VARCHAR(128);
+ALTER TABLE deliveries ADD COLUMN claimed_until TIMESTAMPTZ;
+CREATE INDEX ix_deliveries_claimed_until ON deliveries (claimed_until);
+```
+
 ## Testing
 
 ```bash
@@ -178,11 +201,17 @@ make lint
 
 Covered: the retry schedule and jitter bounds; signature build/verify including tampering, stale timestamps and malformed headers; every circuit-breaker transition; filter matching and validation; endpoint CRUD with secret reveal/rotation; fan-out to matching active endpoints only; idempotent event ids; delivery listing/filters; the dispatcher end to end (signed request contents, success path, failure walk through 10s/1m/5m to dead letter, breaker opening and recovering after cooldown, half-open re-open and manual reset, independent fan-out outcomes, replay of dead and succeeded deliveries, `410` deactivation, batch size, inactive endpoints) and the in-process worker lifecycle.
 
-Tests use an in-memory SQLite engine, an `httpx.MockTransport` as the receiving side and an injected clock, so they run in a couple of seconds with no network.
+Claiming has its own suite: lease defaults, owner/lease recording and release, recovery of deliveries abandoned by a crashed worker, and two PostgreSQL-only tests that prove concurrent claimers receive disjoint batches and that two workers deliver every event exactly once. Those run in CI against a real PostgreSQL service and locally with:
+
+```bash
+docker run -d --rm --name relay-pg -e POSTGRES_USER=relay -e POSTGRES_PASSWORD=relay -p 55432:5432 postgres:16-alpine
+TEST_DATABASE_URL=postgresql://relay:relay@localhost:55432/relay pytest tests/test_claiming.py
+```
+
+The other tests use an in-memory SQLite engine, an `httpx.MockTransport` as the receiving side and an injected clock, so they run in a couple of seconds with no network.
 
 ## Roadmap
 
-- `SELECT … FOR UPDATE SKIP LOCKED` claiming so several worker replicas can share one PostgreSQL queue
 - Per-endpoint rate limiting and concurrency caps
 - Retention job that archives succeeded deliveries and attempts after N days
 - Alembic migrations (schema is created with `create_all` today)
