@@ -4,6 +4,8 @@
 A reliable webhook delivery service: publish an event once, and it is fanned out to every subscribed endpoint with HMAC signatures, exponential backoff, per-endpoint circuit breakers, dead-letter handling and one-click replay.
 
 [![CI](https://github.com/AkibUllah/webhook-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/AkibUllah/webhook-relay/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/AkibUllah/webhook-relay/actions/workflows/codeql.yml/badge.svg)](https://github.com/AkibUllah/webhook-relay/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/AkibUllah/webhook-relay)](https://github.com/AkibUllah/webhook-relay/releases)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -16,6 +18,16 @@ A reliable webhook delivery service: publish an event once, and it is fanned out
 | Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/webhook-relay?quickstart=1) — starts API + worker + PostgreSQL with `docker compose` and seeds one endpoint and one event; open forwarded port 8000 at `/dashboard` (admin key `change-me` for `/v1/*`). |
 | One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/webhook-relay) — `render.yaml` provisions the web service (worker in-process) and a free PostgreSQL; `API_KEY` is generated, read it from the service's environment tab. |
 | Local | `docker compose up` (see Quick Start) |
+
+## Screenshots
+
+![Swagger UI API reference](docs/images/api-reference.png)
+
+Live API reference on GitHub Pages: endpoint registry, event publishing, deliveries and dead letters.
+
+![curl session against a local relay](docs/images/terminal-demo.png)
+
+A real run against a local relay with a short backoff schedule: one event fans out to a healthy receiver (delivered first try) and an offline one (retried, then dead-lettered); duplicate publish is a no-op; metrics at the end.
 
 ## Why this exists
 
@@ -168,7 +180,7 @@ webhook_relay/
 │   └── metrics.py
 ├── api/                  # endpoints, events, deliveries, ops (+ dashboard)
 └── templates/dashboard.html
-tests/                    # 25 tests; MockTransport targets, injected clock
+tests/                    # 39 tests; MockTransport targets, injected clock
 ```
 
 ## Scaling workers
@@ -212,10 +224,10 @@ The other tests use an in-memory SQLite engine, an `httpx.MockTransport` as the 
 
 ## Roadmap
 
-- Per-endpoint rate limiting and concurrency caps
-- Retention job that archives succeeded deliveries and attempts after N days
-- Alembic migrations (schema is created with `create_all` today)
-- Optional OpenTelemetry spans around each attempt
+- [ ] Per-endpoint rate limiting and concurrency caps (#2)
+- [ ] Retention job that archives succeeded deliveries and attempts after N days (#3)
+- [ ] Alembic migrations (schema is created with `create_all` today) (#4)
+- [ ] Optional OpenTelemetry spans around each attempt (#5)
 
 ## License
 
