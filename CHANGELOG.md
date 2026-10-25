@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - API reference and terminal screenshots in the README.
 - Roadmap tracked as GitHub issues under the `v0.2.0` milestone.
 
+### Changed
+
+- CI workflow runs with a read-only `GITHUB_TOKEN` by default; Dependabot groups all GitHub Actions bumps into one PR.
+
 ### Fixed
 
 - Package version (`pyproject.toml`, `webhook_relay.__version__`, `/health`) now reports 0.2.0 to match the released tag.

@@ -31,7 +31,7 @@ updates:
       day: monday
     open-pull-requests-limit: 3
     groups:
-      minor-and-patch:
-        update-types: ["minor", "patch"]
+      actions:
+        patterns: ["*"]
     commit-message:
       prefix: "chore(deps)"
