@@ -35,7 +35,7 @@ jobs:
           cp site/index.html _site/index.html
           python scripts/export_openapi.py _site/openapi.json
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
