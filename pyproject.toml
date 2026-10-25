@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webhook-relay"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reliable webhook delivery service: fan-out, signed requests, exponential backoff, circuit breakers, dead letters and replay"
 readme = "README.md"
 license = { text = "MIT" }
