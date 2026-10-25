@@ -78,6 +78,9 @@ class Delivery(Base):
     )
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set while a worker owns the delivery; cleared once the attempt is recorded.
+    claimed_by: Mapped[str | None] = mapped_column(String(128))
+    claimed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     event: Mapped[Event] = relationship(back_populates="deliveries")
     endpoint: Mapped[Endpoint] = relationship(back_populates="deliveries")

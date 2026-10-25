@@ -165,6 +165,8 @@ class DeliverySummary(BaseModel):
     created_at: datetime
     delivered_at: datetime | None
     dead_lettered_at: datetime | None
+    claimed_by: str | None = None
+    claimed_until: datetime | None = None
 
     @classmethod
     def from_model(cls, d: Delivery) -> DeliverySummary:
@@ -181,6 +183,8 @@ class DeliverySummary(BaseModel):
             created_at=as_utc(d.created_at),  # type: ignore[arg-type]
             delivered_at=as_utc(d.delivered_at),
             dead_lettered_at=as_utc(d.dead_lettered_at),
+            claimed_by=d.claimed_by,
+            claimed_until=as_utc(d.claimed_until),
         )
 
 

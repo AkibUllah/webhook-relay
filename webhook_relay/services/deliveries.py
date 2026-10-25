@@ -63,6 +63,8 @@ class DeliveryService:
         delivery.next_attempt_at = now or utc_now()
         delivery.dead_lettered_at = None
         delivery.last_error = None
+        delivery.claimed_by = None
+        delivery.claimed_until = None
         self.db.flush()
         return delivery
 
