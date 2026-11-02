@@ -25,3 +25,27 @@ def test_managed_postgres_urls_are_rewritten_to_psycopg3(given: str) -> None:
 )
 def test_explicit_driver_urls_are_left_alone(given: str) -> None:
     assert Settings(_env_file=None, database_url=given).database_url == given
+
+
+def test_retention_is_off_by_default() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.retention_days is None
+    assert settings.retention_batch_size == 2000
+    assert settings.retention_interval_seconds == 3600
+
+
+def test_retention_settings_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("RETENTION_DAYS", "30")
+    monkeypatch.setenv("RETENTION_BATCH_SIZE", "500")
+    settings = Settings(_env_file=None)
+    assert (settings.retention_days, settings.retention_batch_size) == (30, 500)
+
+
+@pytest.mark.parametrize(
+    "field", [{"retention_days": 0}, {"retention_batch_size": 0}, {"retention_interval_seconds": 5}]
+)
+def test_retention_settings_reject_nonsense(field) -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **field)

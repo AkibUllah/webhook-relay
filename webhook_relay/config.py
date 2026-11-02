@@ -36,6 +36,15 @@ class Settings(BaseSettings):
     circuit_failure_threshold: int = Field(default=5, ge=1)
     circuit_cooldown_seconds: int = Field(default=300, ge=1)
 
+    # Succeeded deliveries (and their attempts) older than this many days are deleted, along
+    # with events left without deliveries. Unset = keep everything. Dead-lettered, pending and
+    # in-flight deliveries are never purged.
+    retention_days: int | None = Field(default=None, ge=1)
+    # Rows deleted per transaction, so a large backlog never holds long locks.
+    retention_batch_size: int = Field(default=2000, ge=1, le=50_000)
+    # The worker loop purges at most this often.
+    retention_interval_seconds: int = Field(default=3600, ge=60)
+
     @field_validator("backoff_schedule")
     @classmethod
     def _valid_schedule(cls, value: str) -> str:
