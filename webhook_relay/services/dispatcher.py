@@ -30,6 +30,7 @@ from webhook_relay.core.backoff import next_attempt_at
 from webhook_relay.core.circuit import Circuit, CircuitState
 from webhook_relay.core.signing import SIGNATURE_HEADER, build_signature_header
 from webhook_relay.models import Delivery, Endpoint, Event, as_utc, utc_now
+from webhook_relay.services.retention import PurgeResult, RetentionService
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,11 @@ class WorkerStats:
     dead_lettered: int = 0
     skipped_circuit_open: int = 0
     reclaimed: int = 0
+    purges: int = 0
+    purged_deliveries: int = 0
+    purged_attempts: int = 0
+    purged_events: int = 0
+    last_purge_at: datetime | None = None
     worker_id: str | None = None
     running: bool = False
     errors: list[str] = field(default_factory=list)
@@ -67,6 +73,13 @@ class WorkerStats:
             "dead_lettered": self.dead_lettered,
             "skipped_circuit_open": self.skipped_circuit_open,
             "reclaimed": self.reclaimed,
+            "retention": {
+                "purges": self.purges,
+                "deliveries": self.purged_deliveries,
+                "attempts": self.purged_attempts,
+                "events": self.purged_events,
+                "last_purge_at": self.last_purge_at.isoformat() if self.last_purge_at else None,
+            },
             "worker_id": self.worker_id,
         }
 
@@ -113,6 +126,7 @@ class Dispatcher:
         self._clock = clock
         self._rng = rng
         self.stats = WorkerStats(worker_id=settings.worker_id)
+        self.retention = RetentionService(session_factory, settings)
         self._stop = asyncio.Event()
 
     # -- public ------------------------------------------------------------------
@@ -126,6 +140,7 @@ class Dispatcher:
             while not self._stop.is_set():
                 try:
                     processed = await self.run_once()
+                    await self.maybe_purge()
                 except Exception as exc:  # keep the loop alive on unexpected errors
                     logger.exception("worker iteration failed")
                     self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
@@ -160,6 +175,23 @@ class Dispatcher:
                     await self._dispatch(db, client, delivery, now)
                     db.commit()
             return len(due)
+
+    async def maybe_purge(self, now: datetime | None = None) -> PurgeResult | None:
+        """Apply retention if it is enabled and RETENTION_INTERVAL_SECONDS have passed since the
+        last purge. Runs in a thread: a large first purge must not stall deliveries or the API."""
+        if self.settings.retention_days is None:
+            return None
+        now = now or self._clock()
+        last = self.stats.last_purge_at
+        if last and now - last < timedelta(seconds=self.settings.retention_interval_seconds):
+            return None
+        self.stats.last_purge_at = now
+        result = await asyncio.to_thread(self.retention.purge, now)
+        self.stats.purges += 1
+        self.stats.purged_deliveries += result.deliveries
+        self.stats.purged_attempts += result.attempts
+        self.stats.purged_events += result.events
+        return result
 
     # -- internals ---------------------------------------------------------------
     def claim_statement(self, now: datetime) -> Select[tuple[Delivery]]:

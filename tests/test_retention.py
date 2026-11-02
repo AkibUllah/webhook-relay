@@ -159,3 +159,66 @@ async def test_replayed_delivery_is_not_purged(app, client, auth, dispatcher, cl
     assert client.post(f"/v1/deliveries/{delivery_id}/replay", headers=auth).status_code == 202
     assert retention.purge(clock()).deliveries == 0
     assert list(statuses(app).values()) == ["pending"]
+
+
+# -- worker loop --------------------------------------------------------------------------
+
+
+async def test_worker_purges_at_most_once_per_interval(
+    app, client, auth, dispatcher, clock, settings
+):
+    settings.retention_days = 30
+    settings.retention_interval_seconds = 3600
+    seed(app, ("evt_a", "succeeded", T0 - 40 * DAY, 2))
+
+    first = await dispatcher.maybe_purge()
+    assert first is not None and first.deliveries == 1
+    seed(app, ("evt_b", "succeeded", T0 - 40 * DAY, 1))
+    clock.advance(minutes=59)
+    assert await dispatcher.maybe_purge() is None  # too soon
+    assert "evt_b" in statuses(app)
+    clock.advance(minutes=2)
+    assert (await dispatcher.maybe_purge()).deliveries == 1
+
+    worker = client.get("/metrics").json()["worker"]["retention"]
+    assert worker == {
+        "purges": 2,
+        "deliveries": 2,
+        "attempts": 3,
+        "events": 2,
+        "last_purge_at": clock().isoformat(),
+    }
+
+
+async def test_worker_skips_retention_when_disabled(app, client, dispatcher):
+    seed(app, ("evt_a", "succeeded", T0 - 400 * DAY, 1))
+    assert await dispatcher.maybe_purge() is None
+    assert dispatcher.stats.purges == 0
+    assert counts(app)["deliveries"] == 1
+
+
+def test_in_app_worker_loop_applies_retention(settings, target, tmp_path):
+    import asyncio
+
+    import httpx
+    from fastapi.testclient import TestClient
+
+    from webhook_relay.main import create_app
+
+    settings.worker_enabled = True
+    settings.poll_interval_seconds = 0.05
+    settings.retention_days = 30
+    # A file database gives the background purge its own connection, as in production; the
+    # shared in-memory connection would let it see the seed's uncommitted rows.
+    settings.database_url = f"sqlite:///{tmp_path / 'relay.db'}"
+    app = create_app(settings, transport=httpx.MockTransport(target.handler))
+    with TestClient(app) as client:
+        seed(app, ("evt_ancient", "succeeded", T0 - 4000 * DAY, 1))
+        app.state.dispatcher.stats.last_purge_at = None  # the first loop pass may have run already
+        empty = {"events": 0, "deliveries": 0, "attempts": 0}
+        for _ in range(100):  # wait for the whole purge (deliveries, then events) to land
+            if counts(app) == empty and app.state.dispatcher.stats.purged_events:
+                break
+            client.portal.call(asyncio.sleep, 0.05)
+        assert counts(app) == empty
+        assert client.get("/metrics").json()["worker"]["retention"]["deliveries"] == 1
