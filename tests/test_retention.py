@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import func, select
 
-from tests.conftest import T0, publish, register
+from tests.conftest import T0, pg_only, publish, register
 from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event, utc_now
 from webhook_relay.services.retention import RetentionService
 
@@ -310,3 +310,31 @@ def test_purge_query_uses_the_status_delivered_at_index(app, client, retention):
     detail = " ".join(str(row[-1]) for row in plan)
     assert "ix_deliveries_status_delivered_at" in detail, detail
     assert "TEMP B-TREE" not in detail  # the index also provides the ORDER BY
+
+
+# -- PostgreSQL: SKIP LOCKED keeps the purge out of the worker's and replay's way ------------
+
+
+@pg_only
+def test_purge_on_postgres_skips_rows_locked_by_another_transaction(pg_sessions):
+    from sqlalchemy import update
+
+    settings, sessions = pg_sessions
+    settings = settings.model_copy(update={"retention_days": 30, "retention_batch_size": 2})
+    seed_rows(sessions, *[(f"evt_{i}", "succeeded", T0 - (40 + i) * DAY, 2) for i in range(5)])
+    service = RetentionService(sessions, settings)
+
+    with sessions() as replay:  # a replay in progress holds a row lock on evt_0's delivery
+        locked = replay.scalar(
+            select(Delivery).where(Delivery.event_id == "evt_0").with_for_update()
+        )
+        result = service.purge(T0)
+        assert (result.deliveries, result.attempts, result.events) == (4, 8, 4)
+        replay.execute(update(Delivery).where(Delivery.id == locked.id).values(status="pending"))
+        replay.commit()
+
+    assert service.purge(T0).deliveries == 0  # the replayed row is no longer succeeded
+    with sessions() as db:
+        assert db.scalars(select(Delivery.status)).all() == ["pending"]
+        assert db.scalar(select(func.count(DeliveryAttempt.id))) == 2
+        assert db.scalars(select(Event.id)).all() == ["evt_0"]
