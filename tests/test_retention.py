@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import func, select
 
 from tests.conftest import T0, publish, register
-from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event
+from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event, utc_now
 from webhook_relay.services.retention import RetentionService
 
 DAY = timedelta(days=1)
@@ -27,8 +27,12 @@ def statuses(app) -> dict[str, str]:
 
 
 def seed(app, *rows) -> None:
+    seed_rows(app.state.session_factory, *rows)
+
+
+def seed_rows(session_factory, *rows) -> None:
     """rows: (event_id, status, delivered_at or None, attempts). One endpoint, one delivery each."""
-    with app.state.session_factory() as db:
+    with session_factory() as db:
         endpoint = Endpoint(url="https://merchant.example.com/hooks", secret="s" * 24)
         db.add(endpoint)
         db.flush()
@@ -222,3 +226,70 @@ def test_in_app_worker_loop_applies_retention(settings, target, tmp_path):
             client.portal.call(asyncio.sleep, 0.05)
         assert counts(app) == empty
         assert client.get("/metrics").json()["worker"]["retention"]["deliveries"] == 1
+
+
+# -- python -m webhook_relay.worker --purge-once ----------------------------------------------
+
+
+@pytest.fixture
+def file_db(tmp_path, monkeypatch):
+    from webhook_relay.config import get_settings
+
+    url = f"sqlite:///{tmp_path / 'relay.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("LOG_LEVEL", "WARNING")
+    monkeypatch.delenv("RETENTION_DAYS", raising=False)
+    monkeypatch.chdir(tmp_path)  # no stray .env from the repo
+    get_settings.cache_clear()
+    yield url
+    get_settings.cache_clear()
+
+
+def _seed_file_db(url: str) -> None:
+    from webhook_relay.database import init_db, make_engine, make_session_factory
+
+    engine = make_engine(url)
+    init_db(engine)
+    seed_rows(
+        make_session_factory(engine),
+        ("evt_old", "succeeded", utc_now() - 90 * DAY, 2),
+        ("evt_dead", "dead", None, 1),
+    )
+    engine.dispose()
+
+
+def test_purge_once_cli(file_db, monkeypatch, capsys):
+    import json
+
+    from webhook_relay import worker
+
+    _seed_file_db(file_db)
+    monkeypatch.setenv("RETENTION_DAYS", "30")
+    assert worker.main(["--purge-once"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert (out["deliveries"], out["attempts"], out["events"]) == (1, 2, 1)
+    assert worker.main(["--purge-once"]) == 0
+    assert json.loads(capsys.readouterr().out)["deliveries"] == 0
+
+
+def test_purge_once_cli_days_override_and_disabled(file_db, capsys):
+    import json
+
+    from webhook_relay import worker
+
+    _seed_file_db(file_db)
+    assert worker.main(["--purge-once"]) == 2
+    assert "RETENTION_DAYS" in capsys.readouterr().err
+    assert worker.main(["--purge-once", "--days", "120"]) == 0  # 90-day-old row is kept
+    assert json.loads(capsys.readouterr().out)["deliveries"] == 0
+    assert worker.main(["--purge-once", "--days", "60"]) == 0
+    assert json.loads(capsys.readouterr().out)["deliveries"] == 1
+
+
+@pytest.mark.parametrize("argv", [["--days", "30"], ["--purge-once", "--days", "0"]])
+def test_purge_once_cli_rejects_bad_arguments(argv):
+    from webhook_relay import worker
+
+    with pytest.raises(SystemExit) as exc:
+        worker.main(argv)
+    assert exc.value.code == 2
