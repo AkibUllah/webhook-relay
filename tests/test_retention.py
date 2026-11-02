@@ -293,3 +293,20 @@ def test_purge_once_cli_rejects_bad_arguments(argv):
     with pytest.raises(SystemExit) as exc:
         worker.main(argv)
     assert exc.value.code == 2
+
+
+def test_purge_query_uses_the_status_delivered_at_index(app, client, retention):
+    from sqlalchemy import text
+
+    with app.state.session_factory() as db:
+        plan = db.execute(
+            text(
+                "EXPLAIN QUERY PLAN SELECT id FROM deliveries "
+                "WHERE status = 'succeeded' AND delivered_at < :cutoff "
+                "ORDER BY delivered_at LIMIT 100"
+            ),
+            {"cutoff": T0},
+        ).all()
+    detail = " ".join(str(row[-1]) for row in plan)
+    assert "ix_deliveries_status_delivered_at" in detail, detail
+    assert "TEMP B-TREE" not in detail  # the index also provides the ORDER BY
