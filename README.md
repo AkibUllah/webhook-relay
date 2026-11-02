@@ -43,6 +43,7 @@ Every payment and e-commerce platform I have worked on had to tell other systems
 - At-least-once semantics with full attempt history (status code, response excerpt, error, latency) and replay of any delivery, including succeeded ones
 - Worker runs inside the API process (asyncio task) or as a separate process via `python -m webhook_relay.worker`, with graceful shutdown
 - Horizontally scalable workers on PostgreSQL: due rows are claimed with `FOR UPDATE SKIP LOCKED`, so replicas get disjoint batches, and each claim carries a lease (`claimed_by` / `claimed_until`) so deliveries held by a crashed worker are picked up again automatically
+- Retention: with `RETENTION_DAYS` set, succeeded deliveries older than the cutoff are deleted with their attempts, plus events left without deliveries. Dead letters and pending or in-flight rows are never touched. The worker purges hourly in bounded batches, with `SKIP LOCKED` on PostgreSQL so it never waits on the worker or a replay; `python -m webhook_relay.worker --purge-once` runs it from cron instead
 - Dead-letter list, delivery filtering by status/endpoint/event, `X-Total-Count` pagination headers
 - `/health`, `/metrics` (JSON counters: deliveries by status, success rate, open circuits, worker stats) and a server-rendered `/dashboard`
 - Admin API key, structured error envelope, SQLite for dev/tests and PostgreSQL via docker compose
@@ -176,11 +177,12 @@ webhook_relay/
 ├── services/
 │   ├── events.py         # publish + fan-out, idempotent ids
 │   ├── endpoints.py · deliveries.py (replay, dead letters)
-│   ├── dispatcher.py     # the worker: claim, send, record, retry, breaker
+│   ├── dispatcher.py     # the worker: claim, send, record, retry, breaker, hourly purge
+│   ├── retention.py      # batched deletion of old succeeded deliveries and orphaned events
 │   └── metrics.py
 ├── api/                  # endpoints, events, deliveries, ops (+ dashboard)
 └── templates/dashboard.html
-tests/                    # 39 tests; MockTransport targets, injected clock
+tests/                    # 61 tests; MockTransport targets, injected clock
 ```
 
 ## Scaling workers
@@ -204,6 +206,34 @@ ALTER TABLE deliveries ADD COLUMN claimed_until TIMESTAMPTZ;
 CREATE INDEX ix_deliveries_claimed_until ON deliveries (claimed_until);
 ```
 
+## Retention
+
+Every delivery and its attempts are kept forever unless you set `RETENTION_DAYS`. On a busy relay `delivery_attempts` grows fastest, and old succeeded rows only slow down listings and the dashboard.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `RETENTION_DAYS` | unset (keep everything) | Delete succeeded deliveries whose `delivered_at` is older than this, with their attempts, and events older than this that have no deliveries left |
+| `RETENTION_BATCH_SIZE` | `2000` | Rows deleted per transaction |
+| `RETENTION_INTERVAL_SECONDS` | `3600` | How often the worker loop purges |
+
+What is never purged: dead-lettered deliveries (they wait for a replay or a human), `pending` and `delivering` rows, and any event that still has one of those. A delivery replayed while a purge runs is skipped: on PostgreSQL candidate rows are locked with `SKIP LOCKED`, and every DELETE re-checks the conditions. Purged counts appear under `worker.retention` in `/metrics`.
+
+To schedule it outside the worker (for example from cron while workers run with `RETENTION_DAYS` unset):
+
+```bash
+python -m webhook_relay.worker --purge-once            # uses RETENTION_DAYS
+python -m webhook_relay.worker --purge-once --days 30  # one-off override
+# {"cutoff": "2026-10-03T02:00:00+00:00", "deliveries": 1840, "attempts": 2311, "events": 1840, "batches": 3}
+```
+
+Once an event is purged its id can be published again and will fan out as new; keep `RETENTION_DAYS` longer than any window in which your producers retry with the same event id.
+
+Existing databases also need the index the purge query uses:
+
+```sql
+CREATE INDEX ix_deliveries_status_delivered_at ON deliveries (status, delivered_at);
+```
+
 ## Testing
 
 ```bash
@@ -211,13 +241,13 @@ make test
 make lint
 ```
 
-Covered: the retry schedule and jitter bounds; signature build/verify including tampering, stale timestamps and malformed headers; every circuit-breaker transition; filter matching and validation; endpoint CRUD with secret reveal/rotation; fan-out to matching active endpoints only; idempotent event ids; delivery listing/filters; the dispatcher end to end (signed request contents, success path, failure walk through 10s/1m/5m to dead letter, breaker opening and recovering after cooldown, half-open re-open and manual reset, independent fan-out outcomes, replay of dead and succeeded deliveries, `410` deactivation, batch size, inactive endpoints) and the in-process worker lifecycle.
+Covered: the retry schedule and jitter bounds; signature build/verify including tampering, stale timestamps and malformed headers; every circuit-breaker transition; filter matching and validation; endpoint CRUD with secret reveal/rotation; fan-out to matching active endpoints only; idempotent event ids; delivery listing/filters; the dispatcher end to end (signed request contents, success path, failure walk through 10s/1m/5m to dead letter, breaker opening and recovering after cooldown, half-open re-open and manual reset, independent fan-out outcomes, replay of dead and succeeded deliveries, `410` deactivation, batch size, inactive endpoints) and the in-process worker lifecycle. Retention: only old succeeded rows go (dead, pending and in-flight stay), the exclusive cutoff, events kept while any delivery remains and removed once orphaned, bounded batches, a replayed delivery surviving the purge, the hourly gate in the worker loop and its `/metrics` counters, `--purge-once` and its arguments, and the query plan using the new index.
 
-Claiming has its own suite: lease defaults, owner/lease recording and release, recovery of deliveries abandoned by a crashed worker, and two PostgreSQL-only tests that prove concurrent claimers receive disjoint batches and that two workers deliver every event exactly once. Those run in CI against a real PostgreSQL service and locally with:
+Claiming has its own suite: lease defaults, owner/lease recording and release, recovery of deliveries abandoned by a crashed worker, and two PostgreSQL-only tests that prove concurrent claimers receive disjoint batches and that two workers deliver every event exactly once. A third PostgreSQL test shows the purge skipping a row another transaction holds locked. Those run in CI against a real PostgreSQL service and locally with:
 
 ```bash
 docker run -d --rm --name relay-pg -e POSTGRES_USER=relay -e POSTGRES_PASSWORD=relay -p 55432:5432 postgres:16-alpine
-TEST_DATABASE_URL=postgresql://relay:relay@localhost:55432/relay pytest tests/test_claiming.py
+TEST_DATABASE_URL=postgresql://relay:relay@localhost:55432/relay pytest tests/test_claiming.py tests/test_retention.py -k postgres
 ```
 
 The other tests use an in-memory SQLite engine, an `httpx.MockTransport` as the receiving side and an injected clock, so they run in a couple of seconds with no network.
@@ -225,7 +255,6 @@ The other tests use an in-memory SQLite engine, an `httpx.MockTransport` as the 
 ## Roadmap
 
 - [ ] Per-endpoint rate limiting and concurrency caps (#2)
-- [ ] Retention job that archives succeeded deliveries and attempts after N days (#3)
 - [ ] Alembic migrations (schema is created with `create_all` today) (#4)
 - [ ] Optional OpenTelemetry spans around each attempt (#5)
 

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Retention (#3): `RETENTION_DAYS` deletes succeeded deliveries older than the cutoff together with their attempts, and events left without deliveries. Dead-lettered, pending and in-flight deliveries are never purged. Runs from the worker loop at most every `RETENTION_INTERVAL_SECONDS` (default hourly) in batches of `RETENTION_BATCH_SIZE`, skipping rows locked by a worker or replay on PostgreSQL. Off by default.
+- `python -m webhook_relay.worker --purge-once [--days N]` for cron-style retention runs; prints the result as JSON.
+- Retention counters under `worker.retention` in `/metrics`.
+- Composite index `ix_deliveries_status_delivered_at` used by the purge query.
 - CodeQL code scanning workflow and Dependabot configuration (pip, Docker, GitHub Actions).
 - API reference and terminal screenshots in the README.
 - Roadmap tracked as GitHub issues under the `v0.2.0` milestone.
@@ -16,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - CI workflow runs with a read-only `GITHUB_TOKEN` by default; Dependabot groups all GitHub Actions bumps into one PR.
+
+### Upgrading
+
+Existing databases need the new index (tables are created with `create_all`, which does not alter existing tables):
+
+```sql
+CREATE INDEX ix_deliveries_status_delivered_at ON deliveries (status, delivered_at);
+```
 
 ### Fixed
 
