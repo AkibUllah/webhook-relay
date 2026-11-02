@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from webhook_relay.config import Settings
+from webhook_relay.database import init_db
 from webhook_relay.main import create_app
 
 API_KEY = "test-admin-key"
@@ -111,3 +115,21 @@ def publish(client, auth, type="payment.captured", **overrides) -> dict:
     r = client.post("/v1/events", json=body, headers=auth)
     assert r.status_code in (200, 201), r.text
     return r.json()
+
+
+# -- PostgreSQL (claiming and retention suites; CI runs them against a service container) --
+
+PG_URL = os.environ.get("TEST_DATABASE_URL")
+pg_only = pytest.mark.skipif(not PG_URL, reason="set TEST_DATABASE_URL to a PostgreSQL database")
+
+
+@pytest.fixture
+def pg_sessions():
+    settings = Settings(_env_file=None, database_url=PG_URL)
+    engine = create_engine(settings.database_url, future=True)
+    with engine.begin() as conn:
+        for table in ("delivery_attempts", "deliveries", "events", "endpoints"):
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {table} CASCADE")
+    init_db(engine)
+    yield settings, sessionmaker(bind=engine, expire_on_commit=False)
+    engine.dispose()

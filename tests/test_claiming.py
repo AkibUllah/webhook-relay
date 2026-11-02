@@ -4,13 +4,10 @@ import os
 from datetime import timedelta
 
 import httpx
-import pytest
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select
 
-from tests.conftest import T0, publish, register
+from tests.conftest import T0, pg_only, publish, register
 from webhook_relay.config import Settings
-from webhook_relay.database import init_db
 from webhook_relay.models import Delivery, Endpoint, Event
 from webhook_relay.services.dispatcher import Dispatcher
 
@@ -122,22 +119,6 @@ def test_api_exposes_claim_owner_while_in_flight(app, client, auth, dispatcher, 
 
 
 # --------------------------------------------------------------------------- PostgreSQL
-PG_URL = os.environ.get("TEST_DATABASE_URL")
-pg_only = pytest.mark.skipif(not PG_URL, reason="set TEST_DATABASE_URL to a PostgreSQL database")
-
-
-@pytest.fixture
-def pg_sessions():
-    settings = Settings(_env_file=None, database_url=PG_URL)
-    engine = create_engine(settings.database_url, future=True)
-    with engine.begin() as conn:
-        for table in ("delivery_attempts", "deliveries", "events", "endpoints"):
-            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {table} CASCADE")
-    init_db(engine)
-    yield settings, sessionmaker(bind=engine, expire_on_commit=False)
-    engine.dispose()
-
-
 def _seed(sessions, n: int) -> None:
     with sessions() as db:
         endpoint = Endpoint(
