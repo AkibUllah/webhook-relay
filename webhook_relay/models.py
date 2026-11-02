@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -62,6 +62,11 @@ class Event(Base):
 
 class Delivery(Base):
     __tablename__ = "deliveries"
+    __table_args__ = (
+        # Retention finds old succeeded rows with this; without it every purge pass would
+        # scan all succeeded deliveries.
+        Index("ix_deliveries_status_delivered_at", "status", "delivered_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("dlv"))
     event_id: Mapped[str] = mapped_column(ForeignKey("events.id"), index=True)
