@@ -1,3 +1,5 @@
+import pytest
+
 from tests.conftest import publish, register
 
 
@@ -131,3 +133,52 @@ def test_delivery_listing_filters_and_404(client, auth):
     assert client.get("/v1/deliveries", params={"status": "bogus"}, headers=auth).status_code == 422
     assert client.get("/v1/deliveries/dlv_missing", headers=auth).status_code == 404
     assert client.get("/v1/dead-letters", headers=auth).json() == []
+
+
+def test_endpoint_limits_default_to_unlimited(client, auth):
+    body = client.post(
+        "/v1/endpoints", json={"url": "https://a.example.com/hook"}, headers=auth
+    ).json()
+    assert body["max_rps"] is None and body["max_in_flight"] is None
+
+
+def test_endpoint_limits_round_trip_and_clear(client, auth):
+    created = client.post(
+        "/v1/endpoints",
+        json={"url": "https://a.example.com/hook", "max_rps": 2.5, "max_in_flight": 3},
+        headers=auth,
+    ).json()
+    assert created["max_rps"] == 2.5 and created["max_in_flight"] == 3
+    url = f"/v1/endpoints/{created['id']}"
+
+    # Leaving a field out keeps it; null removes it.
+    r = client.patch(url, json={"description": "renamed"}, headers=auth).json()
+    assert r["max_rps"] == 2.5 and r["max_in_flight"] == 3
+    r = client.patch(url, json={"max_rps": 0.5}, headers=auth).json()
+    assert r["max_rps"] == 0.5 and r["max_in_flight"] == 3
+    r = client.patch(url, json={"max_in_flight": None}, headers=auth).json()
+    assert r["max_rps"] == 0.5 and r["max_in_flight"] is None
+    fetched = client.get(url, headers=auth).json()
+    assert fetched["max_rps"] == 0.5 and fetched["max_in_flight"] is None
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"max_rps": 0},
+        {"max_rps": -1},
+        {"max_rps": 10_001},
+        {"max_in_flight": 0},
+        {"max_in_flight": 1.5},
+        {"max_in_flight": 10_001},
+    ],
+)
+def test_endpoint_limit_validation(client, auth, limits):
+    body = {"url": "https://a.example.com/hook", **limits}
+    assert client.post("/v1/endpoints", json=body, headers=auth).status_code == 422
+    created = client.post(
+        "/v1/endpoints", json={"url": "https://a.example.com/hook"}, headers=auth
+    ).json()
+    assert (
+        client.patch(f"/v1/endpoints/{created['id']}", json=limits, headers=auth).status_code == 422
+    )

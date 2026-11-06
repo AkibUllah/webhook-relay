@@ -21,6 +21,8 @@ class EndpointService:
             description=data.description,
             event_types=data.event_types,
             is_active=data.is_active,
+            max_rps=data.max_rps,
+            max_in_flight=data.max_in_flight,
         )
         self.db.add(endpoint)
         self.db.flush()
@@ -47,6 +49,12 @@ class EndpointService:
             endpoint.event_types = data.event_types
         if data.is_active is not None:
             endpoint.is_active = data.is_active
+        # These two are nullable on purpose: an explicit null removes the limit, leaving the
+        # field out keeps it.
+        if "max_rps" in data.model_fields_set:
+            endpoint.max_rps = data.max_rps
+        if "max_in_flight" in data.model_fields_set:
+            endpoint.max_in_flight = data.max_in_flight
         rotated = False
         if data.rotate_secret:
             endpoint.secret = generate_secret()

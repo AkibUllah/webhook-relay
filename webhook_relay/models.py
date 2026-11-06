@@ -3,7 +3,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -38,6 +48,12 @@ class Endpoint(Base):
     circuit_state: Mapped[str] = mapped_column(String(16), default="closed", nullable=False)
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     circuit_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Optional limits; NULL means unlimited. The bucket lives here rather than in worker memory
+    # so every worker draws from the same one.
+    max_rps: Mapped[float | None] = mapped_column(Float)
+    max_in_flight: Mapped[int | None] = mapped_column(Integer)
+    rate_tokens: Mapped[float | None] = mapped_column(Float)
+    rate_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
