@@ -5,7 +5,8 @@
 endpoint's deliveries run on their own lane, and the next claim happens while a lane is still
 busy. Claiming is safe to run from several worker
 replicas against one PostgreSQL database: due rows are locked with `FOR UPDATE SKIP LOCKED`,
-so concurrent workers receive disjoint batches, and every claim carries a lease so work held
+so concurrent workers receive disjoint batches, a batch is shared out evenly between the
+endpoints that have work, and every claim carries a lease so work held
 by a crashed worker is picked up again once the lease expires.
 
 Everything time-related goes through `clock` so tests can drive the schedule
@@ -19,13 +20,15 @@ import json
 import logging
 import random
 import time
+from bisect import bisect_right
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from math import ceil
 
 import httpx
-from sqlalchemy import Select, and_, or_, select, update
+from sqlalchemy import ColumnElement, Select, and_, or_, select, update
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from webhook_relay.config import Settings
@@ -145,6 +148,7 @@ class Dispatcher:
         self._stop = asyncio.Event()
         self._send_slots = asyncio.Semaphore(settings.dispatch_concurrency)
         self._lanes: dict[str, asyncio.Task[None]] = {}
+        self._last_served = ""
 
     # -- public ------------------------------------------------------------------
     async def run_forever(self) -> None:
@@ -290,8 +294,14 @@ class Dispatcher:
             logger.exception("lane for endpoint %s failed", deliveries[0].endpoint_id)
             self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
 
+    @staticmethod
+    def _due_filter(now: datetime) -> ColumnElement[bool]:
+        due = and_(Delivery.status == "pending", Delivery.next_attempt_at <= now)
+        abandoned = and_(Delivery.status == "delivering", Delivery.claimed_until < now)
+        return and_(or_(due, abandoned), Endpoint.is_active.is_(True))
+
     def claim_statement(
-        self, now: datetime, busy: frozenset[str] = frozenset()
+        self, now: datetime, endpoint_id: str | None = None, limit: int | None = None
     ) -> Select[tuple[Delivery]]:
         """Due work: pending deliveries whose time has come, plus deliveries still marked
         `delivering` whose claim lease has expired (their worker died mid-batch).
@@ -301,26 +311,57 @@ class Dispatcher:
         them twice. SQLite has no row locks (it serialises writers), so SQLAlchemy omits the
         clause there and the status/lease check alone keeps a single process consistent.
         """
-        due = and_(Delivery.status == "pending", Delivery.next_attempt_at <= now)
-        abandoned = and_(Delivery.status == "delivering", Delivery.claimed_until < now)
-        return (
+        stmt = (
             select(Delivery)
             .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
             .options(selectinload(Delivery.event), selectinload(Delivery.endpoint))
-            .where(
-                or_(due, abandoned),
-                Endpoint.is_active.is_(True),
-                Delivery.endpoint_id.not_in(busy),
-            )
+            .where(self._due_filter(now))
             .order_by(Delivery.next_attempt_at)
-            .limit(self.settings.batch_size)
+            .limit(limit or self.settings.batch_size)
             .with_for_update(skip_locked=True, of=Delivery)
         )
+        return stmt if endpoint_id is None else stmt.where(Delivery.endpoint_id == endpoint_id)
+
+    def _endpoints_with_due_work(
+        self, db: Session, now: datetime, busy: frozenset[str]
+    ) -> list[str]:
+        """Endpoints that have something to send, in id order starting after the one this worker
+        reached last time, so with more endpoints than batch slots everyone gets a turn."""
+        endpoints = list(
+            db.scalars(
+                select(Delivery.endpoint_id)
+                .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
+                .where(self._due_filter(now), Delivery.endpoint_id.not_in(busy))
+                .group_by(Delivery.endpoint_id)
+                .order_by(Delivery.endpoint_id)
+            ).all()
+        )
+        start = bisect_right(endpoints, self._last_served)
+        return endpoints[start:] + endpoints[:start]
 
     def _claim_due(
         self, db: Session, now: datetime, busy: frozenset[str] = frozenset()
     ) -> list[Delivery]:
-        due = list(db.scalars(self.claim_statement(now, busy)).all())
+        """Fill a batch endpoint by endpoint, so a backlog on one endpoint cannot crowd out the
+        others. Each takes an even share of what is left and whatever it does not use rolls
+        over to the next, so an endpoint alone in the queue still gets the whole batch."""
+        endpoints = self._endpoints_with_due_work(db, now, busy)
+        budget = self.settings.batch_size
+        claimed: list[Delivery] = []
+        for position, endpoint_id in enumerate(endpoints):
+            if budget == 0:
+                break
+            self._last_served = endpoint_id
+            share = ceil(budget / (len(endpoints) - position))
+            taken = self._claim_endpoint(db, endpoint_id, share, now)
+            budget -= len(taken)
+            claimed.extend(taken)
+        return claimed
+
+    def _claim_endpoint(
+        self, db: Session, endpoint_id: str, share: int, now: datetime
+    ) -> list[Delivery]:
+        due = list(db.scalars(self.claim_statement(now, endpoint_id, share)).all())
         lease = timedelta(seconds=self.settings.lease_seconds)
         cooldown = timedelta(seconds=self.settings.circuit_cooldown_seconds)
         claimed: list[Delivery] = []

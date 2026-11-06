@@ -66,6 +66,8 @@ class Delivery(Base):
         # Retention finds old succeeded rows with this; without it every purge pass would
         # scan all succeeded deliveries.
         Index("ix_deliveries_status_delivered_at", "status", "delivered_at"),
+        # Claiming fetches one endpoint's due rows at a time.
+        Index("ix_deliveries_endpoint_status_next", "endpoint_id", "status", "next_attempt_at"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: new_id("dlv"))
