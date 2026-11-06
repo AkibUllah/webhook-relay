@@ -6,7 +6,8 @@ endpoint's deliveries run on their own lane, and the next claim happens while a 
 busy. Claiming is safe to run from several worker
 replicas against one PostgreSQL database: due rows are locked with `FOR UPDATE SKIP LOCKED`,
 so concurrent workers receive disjoint batches, a batch is shared out evenly between the
-endpoints that have work, and every claim carries a lease so work held
+endpoints that have work, per-endpoint rate and in-flight limits are enforced at claim time
+under a row lock so they hold across workers, and every claim carries a lease so work held
 by a crashed worker is picked up again once the lease expires.
 
 Everything time-related goes through `clock` so tests can drive the schedule
@@ -28,13 +29,14 @@ from datetime import datetime, timedelta
 from math import ceil
 
 import httpx
-from sqlalchemy import ColumnElement, Select, and_, or_, select, update
+from sqlalchemy import ColumnElement, Select, and_, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from webhook_relay.config import Settings
 from webhook_relay.core.backoff import next_attempt_at
 from webhook_relay.core.circuit import Circuit, CircuitState
 from webhook_relay.core.signing import SIGNATURE_HEADER, build_signature_header
+from webhook_relay.core.throttle import TokenBucket
 from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event, as_utc, utc_now
 from webhook_relay.services.retention import PurgeResult, RetentionService
 
@@ -45,6 +47,10 @@ EVENT_ID_HEADER = "X-Relay-Event-Id"
 DELIVERY_HEADER = "X-Relay-Delivery-Id"
 ATTEMPT_HEADER = "X-Relay-Attempt"
 TIMESTAMP_HEADER = "X-Relay-Timestamp"
+
+# Shortest pause between claims while waiting for a rate limit to free up, so a high limit does
+# not turn the loop into a busy poll.
+MIN_PAUSE_SECONDS = 0.05
 
 
 @dataclass
@@ -57,6 +63,8 @@ class WorkerStats:
     failed: int = 0
     dead_lettered: int = 0
     skipped_circuit_open: int = 0
+    skipped_rate_limited: int = 0
+    skipped_in_flight: int = 0
     reclaimed: int = 0
     purges: int = 0
     purged_deliveries: int = 0
@@ -78,6 +86,8 @@ class WorkerStats:
             "failed": self.failed,
             "dead_lettered": self.dead_lettered,
             "skipped_circuit_open": self.skipped_circuit_open,
+            "skipped_rate_limited": self.skipped_rate_limited,
+            "skipped_in_flight": self.skipped_in_flight,
             "reclaimed": self.reclaimed,
             "retention": {
                 "purges": self.purges,
@@ -128,6 +138,19 @@ def circuit_to(endpoint: Endpoint, circuit: Circuit) -> None:
     endpoint.circuit_opened_at = circuit.opened_at
 
 
+def bucket_from(endpoint: Endpoint) -> TokenBucket:
+    return TokenBucket.restore(
+        endpoint.max_rps,  # type: ignore[arg-type]
+        endpoint.rate_tokens,
+        as_utc(endpoint.rate_updated_at),
+    )
+
+
+def bucket_to(endpoint: Endpoint, bucket: TokenBucket) -> None:
+    endpoint.rate_tokens = bucket.tokens
+    endpoint.rate_updated_at = bucket.updated_at
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -149,6 +172,7 @@ class Dispatcher:
         self._send_slots = asyncio.Semaphore(settings.dispatch_concurrency)
         self._lanes: dict[str, asyncio.Task[None]] = {}
         self._last_served = ""
+        self._wake_at: datetime | None = None
 
     # -- public ------------------------------------------------------------------
     async def run_forever(self) -> None:
@@ -224,6 +248,8 @@ class Dispatcher:
         now = clock()
         self.stats.runs += 1
         self.stats.last_run_at = now
+        if self._wake_at is not None and self._wake_at <= now:
+            self._wake_at = None
         with self._sessions() as db:
             due = self._claim_due(db, now, busy=frozenset(self._lanes))
         lanes: dict[str, list[Delivery]] = {}
@@ -245,14 +271,14 @@ class Dispatcher:
         lanes = set(self._lanes.values())
         if processed and not lanes:
             return
+        timeout = self.settings.poll_interval_seconds
+        if self._wake_at is not None:  # a rate limit frees up sooner than the next poll
+            until_wake = (self._wake_at - self._clock()).total_seconds()
+            timeout = max(MIN_PAUSE_SECONDS, min(timeout, until_wake))
         waiters = {asyncio.ensure_future(self._stop.wait())}
         if lanes:
             waiters.add(asyncio.ensure_future(asyncio.wait(lanes)))
-        await asyncio.wait(
-            waiters,
-            timeout=self.settings.poll_interval_seconds,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        await asyncio.wait(waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
         for waiter in waiters:
             waiter.cancel()
 
@@ -278,21 +304,27 @@ class Dispatcher:
         clock: Callable[[], datetime],
     ) -> None:
         """Send one endpoint's deliveries in order. Lanes run side by side, so an endpoint that
-        answers slowly only ever delays itself. An unexpected error ends this lane alone; the
-        rows it still held become due again when their lease runs out."""
+        answers slowly only ever delays itself. A lane sends one request at a time, or up to
+        `max_in_flight` for an endpoint that declared how many it can take. An unexpected error
+        ends that sender alone; rows left behind become due again when their lease runs out."""
         queue = deque(deliveries)
-        try:
-            while queue and not self._stop.is_set():
-                delivery = queue.popleft()
-                async with self._send_slots:
-                    moment = clock()
-                    result = await self._send(client, delivery, moment)
-                self._record(delivery.id, result, moment)
-            if queue:  # shutting down: do not make the next worker wait out the lease
-                self._release([d.id for d in queue])
-        except Exception as exc:
-            logger.exception("lane for endpoint %s failed", deliveries[0].endpoint_id)
-            self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
+
+        async def sender() -> None:
+            try:
+                while queue and not self._stop.is_set():
+                    delivery = queue.popleft()
+                    async with self._send_slots:
+                        moment = clock()
+                        result = await self._send(client, delivery, moment)
+                    self._record(delivery.id, result, moment)
+            except Exception as exc:
+                logger.exception("lane for endpoint %s failed", deliveries[0].endpoint_id)
+                self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
+
+        senders = min(deliveries[0].endpoint.max_in_flight or 1, len(queue))
+        await asyncio.gather(*(sender() for _ in range(senders)))
+        if queue and self._stop.is_set():  # do not make the next worker wait out the lease
+            self._release([d.id for d in queue])
 
     @staticmethod
     def _due_filter(now: datetime) -> ColumnElement[bool]:
@@ -301,7 +333,12 @@ class Dispatcher:
         return and_(or_(due, abandoned), Endpoint.is_active.is_(True))
 
     def claim_statement(
-        self, now: datetime, endpoint_id: str | None = None, limit: int | None = None
+        self,
+        now: datetime,
+        endpoint_id: str | None = None,
+        limit: int | None = None,
+        *,
+        oldest_first: bool = False,
     ) -> Select[tuple[Delivery]]:
         """Due work: pending deliveries whose time has come, plus deliveries still marked
         `delivering` whose claim lease has expired (their worker died mid-batch).
@@ -310,13 +347,22 @@ class Dispatcher:
         rows another transaction has already locked instead of blocking on them or claiming
         them twice. SQLite has no row locks (it serialises writers), so SQLAlchemy omits the
         clause there and the status/lease check alone keeps a single process consistent.
+
+        `oldest_first` orders by creation instead of due time. A rate limit moves the rows it
+        holds back to later due times, and they should not lose their place to a younger
+        backlog that simply has not been looked at yet.
         """
+        order = (
+            (Delivery.created_at, Delivery.next_attempt_at)
+            if oldest_first
+            else (Delivery.next_attempt_at,)
+        )
         stmt = (
             select(Delivery)
             .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
             .options(selectinload(Delivery.event), selectinload(Delivery.endpoint))
             .where(self._due_filter(now))
-            .order_by(Delivery.next_attempt_at)
+            .order_by(*order)
             .limit(limit or self.settings.batch_size)
             .with_for_update(skip_locked=True, of=Delivery)
         )
@@ -361,10 +407,43 @@ class Dispatcher:
     def _claim_endpoint(
         self, db: Session, endpoint_id: str, share: int, now: datetime
     ) -> list[Delivery]:
-        due = list(db.scalars(self.claim_statement(now, endpoint_id, share)).all())
+        """Claim up to `share` rows for one endpoint, in a transaction of its own.
+
+        For an endpoint with limits the endpoint row is locked first, so workers take turns
+        reading the in-flight count and spending tokens. That is what makes the limits global:
+        two workers can never both see the last free slot. The lock lasts only for this
+        transaction, `SKIP LOCKED` means a worker passes over an endpoint another worker is
+        claiming for right now, and `FOR NO KEY UPDATE` leaves event fan-out unblocked.
+        Endpoints without limits take no lock at all.
+        """
+        endpoint = db.get(Endpoint, endpoint_id)
+        limited = endpoint.max_rps is not None or endpoint.max_in_flight is not None
+        if limited:
+            endpoint = db.scalar(
+                select(Endpoint)
+                .where(Endpoint.id == endpoint_id)
+                .with_for_update(skip_locked=True, key_share=True)
+                .execution_options(populate_existing=True)
+            )
+            if endpoint is None:
+                return []
+            if endpoint.max_in_flight is not None:
+                room = self._in_flight_room(db, endpoint, now)
+                if room <= 0:
+                    # Stays pending and due, untouched: no telling when a slot frees up.
+                    self.stats.skipped_in_flight += 1
+                    db.commit()
+                    return []
+                share = min(share, room)
+
+        due = list(
+            db.scalars(self.claim_statement(now, endpoint_id, share, oldest_first=limited)).all()
+        )
+        bucket = None if endpoint.max_rps is None else bucket_from(endpoint).refill(now)
         lease = timedelta(seconds=self.settings.lease_seconds)
         cooldown = timedelta(seconds=self.settings.circuit_cooldown_seconds)
         claimed: list[Delivery] = []
+        waiting = 0
         for delivery in due:
             circuit = circuit_from(delivery.endpoint)
             allowed, circuit = circuit.allows_request(cooldown, now)
@@ -372,9 +451,18 @@ class Dispatcher:
             if not allowed:
                 # Leave it pending; push the check past the cooldown so we do not spin.
                 retry_after = circuit.retry_after(cooldown, now) or 0.0
-                delivery.next_attempt_at = now + timedelta(seconds=retry_after)
+                self._hold(delivery, now + timedelta(seconds=retry_after))
                 self.stats.skipped_circuit_open += 1
                 continue
+            if bucket is not None:
+                allowed, bucket = bucket.take()
+                if not allowed:
+                    # Each waiting row gets its own slot, so they come due at the allowed rate
+                    # instead of all together. Nothing was sent: no attempt is used up.
+                    waiting += 1
+                    self._hold(delivery, now + timedelta(seconds=bucket.wait_seconds(waiting)))
+                    self.stats.skipped_rate_limited += 1
+                    continue
             if delivery.status == "delivering":
                 # The previous owner's lease ran out before it recorded an outcome. The send
                 # may or may not have happened, so this is a redelivery (at-least-once).
@@ -389,8 +477,37 @@ class Dispatcher:
             delivery.claimed_by = self.settings.worker_id
             delivery.claimed_until = now + lease
             claimed.append(delivery)
+        if bucket is not None:
+            bucket_to(endpoint, bucket)
+            if due and bucket.tokens < 1:
+                self._wake_by(now + timedelta(seconds=bucket.wait_seconds()))
         db.commit()
         return claimed
+
+    @staticmethod
+    def _in_flight_room(db: Session, endpoint: Endpoint, now: datetime) -> int:
+        """Free slots under `max_in_flight`, counted across all workers. A claim whose lease has
+        run out no longer counts: its worker is gone and the row is up for reclaiming."""
+        in_flight = db.scalar(
+            select(func.count(Delivery.id)).where(
+                Delivery.endpoint_id == endpoint.id,
+                Delivery.status == "delivering",
+                Delivery.claimed_until >= now,
+            )
+        )
+        return endpoint.max_in_flight - int(in_flight or 0)  # type: ignore[operator]
+
+    @staticmethod
+    def _hold(delivery: Delivery, until: datetime) -> None:
+        """Put a delivery back in the queue without sending it. Also covers a row reclaimed from
+        a dead worker, which is still marked `delivering`."""
+        delivery.status = "pending"
+        delivery.claimed_by = None
+        delivery.claimed_until = None
+        delivery.next_attempt_at = until
+
+    def _wake_by(self, moment: datetime) -> None:
+        self._wake_at = moment if self._wake_at is None else min(self._wake_at, moment)
 
     async def _send(
         self, client: httpx.AsyncClient, delivery: Delivery, now: datetime
