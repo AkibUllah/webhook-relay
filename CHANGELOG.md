@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-endpoint rate limits and concurrency caps (#2): optional `max_rps` and `max_in_flight` on create and update. Both are enforced at claim time under a lock on the endpoint row, with the token bucket stored on that row, so they hold across all workers on PostgreSQL. Throttled deliveries stay `pending` and never use up a retry attempt.
+- Every endpoint's deliveries run on their own lane, in parallel with other endpoints and up to `max_in_flight` at once within one, so a slow receiver only delays itself. `DISPATCH_CONCURRENCY` (default 20) bounds open requests per worker.
+- `worker.skipped_rate_limited`, `worker.skipped_in_flight` and `endpoints_limited` in `/metrics`; limits on the dashboard.
 - Retention (#3): `RETENTION_DAYS` deletes succeeded deliveries older than the cutoff together with their attempts, and events left without deliveries. Dead-lettered, pending and in-flight deliveries are never purged. Runs from the worker loop at most every `RETENTION_INTERVAL_SECONDS` (default hourly) in batches of `RETENTION_BATCH_SIZE`, skipping rows locked by a worker or replay on PostgreSQL. Off by default.
 - `python -m webhook_relay.worker --purge-once [--days N]` for cron-style retention runs; prints the result as JSON.
 - Retention counters under `worker.retention` in `/metrics`.
@@ -19,14 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A batch is shared evenly between endpoints with due work instead of being filled oldest first, with unused slots rolling over. An endpoint alone in the queue still gets the whole batch.
+- The worker claims again while a slow lane is still running, leaving out endpoints with a running lane, and a stopping worker hands back rows it never sent instead of working through them.
+- Each attempt is recorded in its own short transaction and no database connection is held during a request. Request timestamps and signatures are now taken at send time rather than at the start of the batch.
 - CI workflow runs with a read-only `GITHUB_TOKEN` by default; Dependabot groups all GitHub Actions bumps into one PR.
 
 ### Upgrading
 
-Existing databases need the new index (tables are created with `create_all`, which does not alter existing tables):
+Existing databases need the new columns and indexes (tables are created with `create_all`, which does not alter existing tables):
 
 ```sql
 CREATE INDEX ix_deliveries_status_delivered_at ON deliveries (status, delivered_at);
+ALTER TABLE endpoints ADD COLUMN max_rps DOUBLE PRECISION;
+ALTER TABLE endpoints ADD COLUMN max_in_flight INTEGER;
+ALTER TABLE endpoints ADD COLUMN rate_tokens DOUBLE PRECISION;
+ALTER TABLE endpoints ADD COLUMN rate_updated_at TIMESTAMPTZ;
+CREATE INDEX ix_deliveries_endpoint_status_next ON deliveries (endpoint_id, status, next_attempt_at);
 ```
 
 ### Fixed

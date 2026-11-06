@@ -43,6 +43,8 @@ Every payment and e-commerce platform I have worked on had to tell other systems
 - At-least-once semantics with full attempt history (status code, response excerpt, error, latency) and replay of any delivery, including succeeded ones
 - Worker runs inside the API process (asyncio task) or as a separate process via `python -m webhook_relay.worker`, with graceful shutdown
 - Horizontally scalable workers on PostgreSQL: due rows are claimed with `FOR UPDATE SKIP LOCKED`, so replicas get disjoint batches, and each claim carries a lease (`claimed_by` / `claimed_until`) so deliveries held by a crashed worker are picked up again automatically
+- Per-endpoint limits: optional `max_rps` and `max_in_flight` hold across all workers because they are enforced in PostgreSQL at claim time. Throttled deliveries wait in `pending` and never use up a retry attempt
+- Isolated endpoints: every endpoint gets its own lane and an even share of each batch, so one slow receiver or one burst cannot hold up the others
 - Retention: with `RETENTION_DAYS` set, succeeded deliveries older than the cutoff are deleted with their attempts, plus events left without deliveries. Dead letters and pending or in-flight rows are never touched. The worker purges hourly in bounded batches, with `SKIP LOCKED` on PostgreSQL so it never waits on the worker or a replay; `python -m webhook_relay.worker --purge-once` runs it from cron instead
 - Dead-letter list, delivery filtering by status/endpoint/event, `X-Total-Count` pagination headers
 - `/health`, `/metrics` (JSON counters: deliveries by status, success rate, open circuits, worker stats) and a server-rendered `/dashboard`
@@ -59,8 +61,10 @@ flowchart LR
     FAN --> D2[(delivery B)]
     W[Dispatcher worker<br/>poll due deliveries] --> D1 & D2
     W -- "circuit check" --> CB{breaker}
-    CB -- closed / half-open --> SEND[signed POST]
+    CB -- closed / half-open --> LIM{limits}
     CB -- open --> WAIT[stay pending until cooldown]
+    LIM -- within max_rps and max_in_flight --> SEND[signed POST<br/>one lane per endpoint]
+    LIM -- over --> HOLD[stay pending, no attempt used]
     SEND -- 2xx --> OK[succeeded]
     SEND -- error --> RETRY[attempt++ → next_attempt_at<br/>10s,1m,5m,30m,2h,12h]
     RETRY -- max attempts --> DLQ[dead letter]
@@ -73,6 +77,8 @@ Design notes:
 
 - **Deliveries are rows, not tasks.** A delivery is created in the same transaction as the event, so a crash after `201 Created` cannot lose a notification. The worker simply queries `status='pending' AND next_attempt_at <= now`.
 - **Claims are leased, not owned forever.** Claiming locks due rows with `FOR UPDATE OF deliveries SKIP LOCKED`; concurrent workers skip rows another transaction holds instead of waiting or double-sending. Each claimed delivery records the worker id and a lease deadline (by default long enough for a whole batch to time out). If a worker is killed mid-batch, its `delivering` rows become due again when the lease expires, are counted as `reclaimed` in `/metrics`, and are redelivered, which is consistent with at-least-once semantics.
+- **Limits live in the database, not the worker.** A token bucket in worker memory would give each replica its own allowance. Instead a claim for a limited endpoint locks the endpoint row, counts live `delivering` rows and spends tokens stored on that row, all in one short transaction, so two workers cannot both take the last slot. Workers pass over a locked endpoint with `SKIP LOCKED` and `FOR NO KEY UPDATE` leaves event fan-out unblocked. Endpoints without limits take no lock.
+- **A slow endpoint only delays itself.** Claiming hands each endpoint with due work an even share of the batch, with unused slots rolling over, and each endpoint's deliveries run on their own lane. The worker claims again while a lane is busy, so new work for other endpoints waits one poll interval at most. No database connection is held during a request.
 - **Time is injected.** The dispatcher takes a `clock`; tests advance it to walk through the whole retry schedule and the circuit cooldown without sleeping.
 - **The breaker is per endpoint and pure.** `core.circuit.Circuit` is an immutable value object; the dispatcher reads it from the endpoint row, applies success/failure, writes it back. Blocked deliveries stay pending with `next_attempt_at` pushed to the cooldown boundary so the loop does not spin.
 - **Signatures cover the timestamp.** The signed string is `"<t>.<body>"`, and receivers check `t` against a tolerance window, so a captured request cannot be replayed later.
@@ -140,9 +146,9 @@ All `/v1` routes require `X-API-Key` when `API_KEY` is set. Errors are `{"error"
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/endpoints` | Register an endpoint (`url`, optional `secret`, `event_types`, `description`); returns the secret once |
+| `POST` | `/v1/endpoints` | Register an endpoint (`url`, optional `secret`, `event_types`, `description`, `max_rps`, `max_in_flight`); returns the secret once |
 | `GET` | `/v1/endpoints` · `/v1/endpoints/{id}` | List / fetch (secret never returned) |
-| `PATCH` | `/v1/endpoints/{id}` | Update URL, filters, description, `is_active`; `rotate_secret: true` returns a new secret |
+| `PATCH` | `/v1/endpoints/{id}` | Update URL, filters, description, `is_active`, `max_rps`, `max_in_flight` (`null` removes a limit); `rotate_secret: true` returns a new secret |
 | `DELETE` | `/v1/endpoints/{id}` | Deactivate (delivery history kept) |
 | `POST` | `/v1/endpoints/{id}/reset-circuit` | Close an open breaker manually |
 | `POST` | `/v1/events` | Publish; `201` with deliveries, or `200` + `duplicate: true` for a known `id` |
@@ -173,16 +179,17 @@ webhook_relay/
 │   ├── backoff.py        # schedule, jitter, next_attempt_at
 │   ├── signing.py        # X-Relay-Signature build/verify
 │   ├── circuit.py        # Circuit value object (closed/open/half_open)
+│   ├── throttle.py       # TokenBucket value object behind max_rps
 │   └── matching.py       # event-type filters
 ├── services/
 │   ├── events.py         # publish + fan-out, idempotent ids
 │   ├── endpoints.py · deliveries.py (replay, dead letters)
-│   ├── dispatcher.py     # the worker: claim, send, record, retry, breaker, hourly purge
+│   ├── dispatcher.py     # the worker: fair claim, limits, lanes, record, retry, breaker, hourly purge
 │   ├── retention.py      # batched deletion of old succeeded deliveries and orphaned events
 │   └── metrics.py
 ├── api/                  # endpoints, events, deliveries, ops (+ dashboard)
 └── templates/dashboard.html
-tests/                    # 61 tests; MockTransport targets, injected clock
+tests/                    # 119 tests; MockTransport targets, injected clock
 ```
 
 ## Scaling workers
@@ -204,6 +211,53 @@ Upgrading an existing database from 0.1 (tables are created with `create_all`, w
 ALTER TABLE deliveries ADD COLUMN claimed_by VARCHAR(128);
 ALTER TABLE deliveries ADD COLUMN claimed_until TIMESTAMPTZ;
 CREATE INDEX ix_deliveries_claimed_until ON deliveries (claimed_until);
+```
+
+## Rate limits and concurrency caps
+
+Protect a receiver that can only take so much. Both limits are optional, set per endpoint, and shared by all workers:
+
+```bash
+curl -s -X PATCH localhost:8000/v1/endpoints/$ID -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"max_rps": 5, "max_in_flight": 2}'
+```
+
+| Field | Range | Meaning |
+|---|---|---|
+| `max_rps` | above 0 up to 10000, fractions allowed | Sustained requests per second. One second's worth can go out as a burst, so over any T seconds an endpoint receives at most `max(1, max_rps) + max_rps × T` requests. `0.5` means one every two seconds |
+| `max_in_flight` | 1 to 10000 | Requests open at once. A lane sends this many in parallel; without the setting it sends one at a time |
+
+In a `PATCH`, leaving a field out keeps it and `null` removes it. With neither set, claiming and delivery work as they always have, apart from the lanes and batch sharing below.
+
+Waiting is not failing. A delivery over `max_rps` stays `pending` and its `next_attempt_at` moves to the slot the bucket can serve it in, spaced at the allowed rate. One over `max_in_flight` stays due and untouched until a slot frees up. Neither sends a request, writes an attempt, changes `attempt_count` or counts toward `MAX_ATTEMPTS`, however long the wait. Retries and replays go through the same limits. Rate-limited endpoints claim in creation order, so a held delivery keeps its place in a backlog.
+
+Things to plan for:
+
+- Only as many rows as fit in the endpoint's share of a batch are rescheduled in one round, so in a large backlog younger rows can still show an old `next_attempt_at` until they are reached.
+- A slot under `max_in_flight` is held until the attempt is recorded. If a worker dies its slots come back when the claim lease runs out, so a low cap with the default lease can stall for minutes; set `CLAIM_LEASE_SECONDS` lower if that matters.
+- Tokens are spent at claim time using each worker's clock. Keep workers on NTP. A worker running behind earns no extra tokens.
+- The limits rely on row locks, so they are global on PostgreSQL. SQLite has no row locks: run a single worker there, as with claiming.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `DISPATCH_CONCURRENCY` | `20` | Requests one worker keeps open at once across all endpoints. Lower it to protect the worker, raise it when many endpoints are slow at the same time |
+
+These appear in `/metrics`. Like everything under `worker`, the two skip counters belong to the process that runs the loop: with a dedicated worker the API reports zero and the worker logs its totals on exit.
+
+| Metric | Meaning |
+|---|---|
+| `endpoints_limited` | Endpoints with at least one limit set |
+| `worker.skipped_rate_limited` | Deliveries held back by `max_rps` |
+| `worker.skipped_in_flight` | Times an endpoint was passed over because `max_in_flight` was reached |
+
+Existing databases need the new columns and index (tables are created with `create_all`, which does not alter existing tables):
+
+```sql
+ALTER TABLE endpoints ADD COLUMN max_rps DOUBLE PRECISION;
+ALTER TABLE endpoints ADD COLUMN max_in_flight INTEGER;
+ALTER TABLE endpoints ADD COLUMN rate_tokens DOUBLE PRECISION;
+ALTER TABLE endpoints ADD COLUMN rate_updated_at TIMESTAMPTZ;
+CREATE INDEX ix_deliveries_endpoint_status_next ON deliveries (endpoint_id, status, next_attempt_at);
 ```
 
 ## Retention
@@ -243,18 +297,21 @@ make lint
 
 Covered: the retry schedule and jitter bounds; signature build/verify including tampering, stale timestamps and malformed headers; every circuit-breaker transition; filter matching and validation; endpoint CRUD with secret reveal/rotation; fan-out to matching active endpoints only; idempotent event ids; delivery listing/filters; the dispatcher end to end (signed request contents, success path, failure walk through 10s/1m/5m to dead letter, breaker opening and recovering after cooldown, half-open re-open and manual reset, independent fan-out outcomes, replay of dead and succeeded deliveries, `410` deactivation, batch size, inactive endpoints) and the in-process worker lifecycle. Retention: only old succeeded rows go (dead, pending and in-flight stay), the exclusive cutoff, events kept while any delivery remains and removed once orphaned, bounded batches, a replayed delivery surviving the purge, the hourly gate in the worker loop and its `/metrics` counters, `--purge-once` and its arguments, and the query plan using the new index.
 
-Claiming has its own suite: lease defaults, owner/lease recording and release, recovery of deliveries abandoned by a crashed worker, and two PostgreSQL-only tests that prove concurrent claimers receive disjoint batches and that two workers deliver every event exactly once. A third PostgreSQL test shows the purge skipping a row another transaction holds locked. Those run in CI against a real PostgreSQL service and locally with:
+Claiming has its own suite: lease defaults, owner/lease recording and release, recovery of deliveries abandoned by a crashed worker, and two PostgreSQL-only tests that prove concurrent claimers receive disjoint batches and that two workers deliver every event exactly once. A third PostgreSQL test shows the purge skipping a row another transaction holds locked.
+
+Limits and isolation: the token bucket on its own, in-flight caps, spaced rate-limited rows that use no attempt however long they wait, retries paying for tokens, limits shared between workers, fair batch sharing, lanes that keep a slow endpoint from delaying the others in a batch and across claims, and handing back unsent rows at shutdown. On PostgreSQL, worker threads with separate connections race for the same endpoint and the cap and bucket still come out exact, including end to end, without blocking event fan-out.
+
+The PostgreSQL tests run in CI against a real service and locally with:
 
 ```bash
 docker run -d --rm --name relay-pg -e POSTGRES_USER=relay -e POSTGRES_PASSWORD=relay -p 55432:5432 postgres:16-alpine
-TEST_DATABASE_URL=postgresql://relay:relay@localhost:55432/relay pytest tests/test_claiming.py tests/test_retention.py -k postgres
+TEST_DATABASE_URL=postgresql://relay:relay@localhost:55432/relay pytest tests/test_claiming.py tests/test_retention.py tests/test_throttling_postgres.py -k postgres
 ```
 
 The other tests use an in-memory SQLite engine, an `httpx.MockTransport` as the receiving side and an injected clock, so they run in a couple of seconds with no network.
 
 ## Roadmap
 
-- [ ] Per-endpoint rate limiting and concurrency caps (#2)
 - [ ] Alembic migrations (schema is created with `create_all` today) (#4)
 - [ ] Optional OpenTelemetry spans around each attempt (#5)
 
