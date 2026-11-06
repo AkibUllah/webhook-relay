@@ -1,7 +1,9 @@
 """The delivery worker.
 
 `run_once(now)` picks due deliveries, sends them, records attempts and schedules retries.
-`run_forever()` loops with a poll interval. Claiming is safe to run from several worker
+`run_forever()` does the same on a poll interval without waiting for slow endpoints: each
+endpoint's deliveries run on their own lane, and the next claim happens while a lane is still
+busy. Claiming is safe to run from several worker
 replicas against one PostgreSQL database: due rows are locked with `FOR UPDATE SKIP LOCKED`,
 so concurrent workers receive disjoint batches, and every claim carries a lease so work held
 by a crashed worker is picked up again once the lease expires.
@@ -23,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import httpx
-from sqlalchemy import Select, and_, or_, select
+from sqlalchemy import Select, and_, or_, select, update
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from webhook_relay.config import Settings
@@ -142,6 +144,7 @@ class Dispatcher:
         self.retention = RetentionService(session_factory, settings)
         self._stop = asyncio.Event()
         self._send_slots = asyncio.Semaphore(settings.dispatch_concurrency)
+        self._lanes: dict[str, asyncio.Task[None]] = {}
 
     # -- public ------------------------------------------------------------------
     async def run_forever(self) -> None:
@@ -151,21 +154,24 @@ class Dispatcher:
             "delivery worker started (poll every %.1fs)", self.settings.poll_interval_seconds
         )
         try:
-            while not self._stop.is_set():
+            async with self._http_client() as client:
                 try:
-                    processed = await self.run_once()
-                    await self.maybe_purge()
-                except Exception as exc:  # keep the loop alive on unexpected errors
-                    logger.exception("worker iteration failed")
-                    self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
-                    processed = 0
-                if processed == 0:
-                    try:
-                        await asyncio.wait_for(
-                            self._stop.wait(), timeout=self.settings.poll_interval_seconds
-                        )
-                    except asyncio.TimeoutError:
-                        pass
+                    while not self._stop.is_set():
+                        try:
+                            processed = self._start_batch(client, self._clock)
+                            await self.maybe_purge()
+                        except Exception as exc:  # keep the loop alive on unexpected errors
+                            logger.exception("worker iteration failed")
+                            self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
+                            processed = 0
+                        await self._pause(processed)
+                    await self._wait_for_lanes()
+                except asyncio.CancelledError:
+                    lanes = list(self._lanes.values())
+                    for lane in lanes:
+                        lane.cancel()
+                    await asyncio.gather(*lanes, return_exceptions=True)
+                    raise
         finally:
             self.stats.running = False
             logger.info("delivery worker stopped")
@@ -176,19 +182,10 @@ class Dispatcher:
     async def run_once(self, now: datetime | None = None) -> int:
         """Process one batch of due deliveries. Returns the number dispatched."""
         clock = self._clock if now is None else (lambda: now)
-        moment = clock()
-        self.stats.runs += 1
-        self.stats.last_run_at = moment
-        with self._sessions() as db:
-            due = self._claim_due(db, moment)
-        if not due:
-            return 0
-        lanes: dict[str, list[Delivery]] = {}
-        for delivery in due:
-            lanes.setdefault(delivery.endpoint_id, []).append(delivery)
         async with self._http_client() as client:
-            await asyncio.gather(*(self._run_lane(client, lane, clock) for lane in lanes.values()))
-        return len(due)
+            processed = self._start_batch(client, clock)
+            await self._wait_for_lanes()
+        return processed
 
     async def maybe_purge(self, now: datetime | None = None) -> PurgeResult | None:
         """Apply retention if it is enabled and RETENTION_INTERVAL_SECONDS have passed since the
@@ -216,6 +213,60 @@ class Dispatcher:
             limits=httpx.Limits(max_connections=slots, max_keepalive_connections=slots),
         )
 
+    def _start_batch(self, client: httpx.AsyncClient, clock: Callable[[], datetime]) -> int:
+        """Claim due work and start a lane per endpoint. Endpoints with a lane still running are
+        left out, which keeps sends to one endpoint in order within this worker while everyone
+        else carries on. Returns the number of deliveries claimed."""
+        now = clock()
+        self.stats.runs += 1
+        self.stats.last_run_at = now
+        with self._sessions() as db:
+            due = self._claim_due(db, now, busy=frozenset(self._lanes))
+        lanes: dict[str, list[Delivery]] = {}
+        for delivery in due:
+            lanes.setdefault(delivery.endpoint_id, []).append(delivery)
+        for endpoint_id, deliveries in lanes.items():
+            lane = asyncio.create_task(self._run_lane(client, deliveries, clock))
+            self._lanes[endpoint_id] = lane
+            lane.add_done_callback(lambda _, key=endpoint_id: self._lanes.pop(key, None))
+        return len(due)
+
+    async def _wait_for_lanes(self) -> None:
+        await asyncio.gather(*self._lanes.values())
+
+    async def _pause(self, processed: int) -> None:
+        """Wait before the next claim: until every lane is done, a stop is requested or the poll
+        interval passes, whichever comes first. The poll interval is therefore the longest a
+        slow lane can keep this worker from picking up other endpoints' work."""
+        lanes = set(self._lanes.values())
+        if processed and not lanes:
+            return
+        waiters = {asyncio.ensure_future(self._stop.wait())}
+        if lanes:
+            waiters.add(asyncio.ensure_future(asyncio.wait(lanes)))
+        await asyncio.wait(
+            waiters,
+            timeout=self.settings.poll_interval_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for waiter in waiters:
+            waiter.cancel()
+
+    def _release(self, delivery_ids: list[str]) -> None:
+        """Hand back claimed deliveries that were never sent. No attempt happened, so none is
+        recorded and they are immediately due for the next worker."""
+        with self._sessions() as db:
+            db.execute(
+                update(Delivery)
+                .where(
+                    Delivery.id.in_(delivery_ids),
+                    Delivery.status == "delivering",
+                    Delivery.claimed_by == self.settings.worker_id,
+                )
+                .values(status="pending", claimed_by=None, claimed_until=None)
+            )
+            db.commit()
+
     async def _run_lane(
         self,
         client: httpx.AsyncClient,
@@ -227,17 +278,21 @@ class Dispatcher:
         rows it still held become due again when their lease runs out."""
         queue = deque(deliveries)
         try:
-            while queue:
+            while queue and not self._stop.is_set():
                 delivery = queue.popleft()
                 async with self._send_slots:
                     moment = clock()
                     result = await self._send(client, delivery, moment)
                 self._record(delivery.id, result, moment)
+            if queue:  # shutting down: do not make the next worker wait out the lease
+                self._release([d.id for d in queue])
         except Exception as exc:
             logger.exception("lane for endpoint %s failed", deliveries[0].endpoint_id)
             self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
 
-    def claim_statement(self, now: datetime) -> Select[tuple[Delivery]]:
+    def claim_statement(
+        self, now: datetime, busy: frozenset[str] = frozenset()
+    ) -> Select[tuple[Delivery]]:
         """Due work: pending deliveries whose time has come, plus deliveries still marked
         `delivering` whose claim lease has expired (their worker died mid-batch).
 
@@ -252,14 +307,20 @@ class Dispatcher:
             select(Delivery)
             .join(Endpoint, Delivery.endpoint_id == Endpoint.id)
             .options(selectinload(Delivery.event), selectinload(Delivery.endpoint))
-            .where(or_(due, abandoned), Endpoint.is_active.is_(True))
+            .where(
+                or_(due, abandoned),
+                Endpoint.is_active.is_(True),
+                Delivery.endpoint_id.not_in(busy),
+            )
             .order_by(Delivery.next_attempt_at)
             .limit(self.settings.batch_size)
             .with_for_update(skip_locked=True, of=Delivery)
         )
 
-    def _claim_due(self, db: Session, now: datetime) -> list[Delivery]:
-        due = list(db.scalars(self.claim_statement(now)).all())
+    def _claim_due(
+        self, db: Session, now: datetime, busy: frozenset[str] = frozenset()
+    ) -> list[Delivery]:
+        due = list(db.scalars(self.claim_statement(now, busy)).all())
         lease = timedelta(seconds=self.settings.lease_seconds)
         cooldown = timedelta(seconds=self.settings.circuit_cooldown_seconds)
         claimed: list[Delivery] = []
