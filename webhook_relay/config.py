@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     jitter_fraction: float = Field(default=0.1, ge=0, lt=1)
     signature_tolerance_seconds: int = 300
 
+    # Requests one worker may have open at once, across all endpoints. Each endpoint gets its
+    # own lane, so a slow receiver takes up a slot rather than holding the whole batch.
+    dispatch_concurrency: int = Field(default=20, ge=1, le=1000)
+
     worker_id: str = Field(default_factory=lambda: f"{socket.gethostname()}-{os.getpid()}")
     # How long a claimed delivery stays reserved for the worker that claimed it. If the worker
     # dies mid-batch the lease runs out and another worker picks the delivery up again.

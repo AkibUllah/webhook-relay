@@ -17,7 +17,8 @@ import json
 import logging
 import random
 import time
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -140,6 +141,7 @@ class Dispatcher:
         self.stats = WorkerStats(worker_id=settings.worker_id)
         self.retention = RetentionService(session_factory, settings)
         self._stop = asyncio.Event()
+        self._send_slots = asyncio.Semaphore(settings.dispatch_concurrency)
 
     # -- public ------------------------------------------------------------------
     async def run_forever(self) -> None:
@@ -173,19 +175,19 @@ class Dispatcher:
 
     async def run_once(self, now: datetime | None = None) -> int:
         """Process one batch of due deliveries. Returns the number dispatched."""
-        now = now or self._clock()
+        clock = self._clock if now is None else (lambda: now)
+        moment = clock()
         self.stats.runs += 1
-        self.stats.last_run_at = now
+        self.stats.last_run_at = moment
         with self._sessions() as db:
-            due = self._claim_due(db, now)
+            due = self._claim_due(db, moment)
         if not due:
             return 0
-        async with httpx.AsyncClient(
-            timeout=self.settings.http_timeout_seconds, transport=self._transport
-        ) as client:
-            for delivery in due:
-                result = await self._send(client, delivery, now)
-                self._record(delivery.id, result, now)
+        lanes: dict[str, list[Delivery]] = {}
+        for delivery in due:
+            lanes.setdefault(delivery.endpoint_id, []).append(delivery)
+        async with self._http_client() as client:
+            await asyncio.gather(*(self._run_lane(client, lane, clock) for lane in lanes.values()))
         return len(due)
 
     async def maybe_purge(self, now: datetime | None = None) -> PurgeResult | None:
@@ -206,6 +208,35 @@ class Dispatcher:
         return result
 
     # -- internals ---------------------------------------------------------------
+    def _http_client(self) -> httpx.AsyncClient:
+        slots = self.settings.dispatch_concurrency
+        return httpx.AsyncClient(
+            timeout=self.settings.http_timeout_seconds,
+            transport=self._transport,
+            limits=httpx.Limits(max_connections=slots, max_keepalive_connections=slots),
+        )
+
+    async def _run_lane(
+        self,
+        client: httpx.AsyncClient,
+        deliveries: Sequence[Delivery],
+        clock: Callable[[], datetime],
+    ) -> None:
+        """Send one endpoint's deliveries in order. Lanes run side by side, so an endpoint that
+        answers slowly only ever delays itself. An unexpected error ends this lane alone; the
+        rows it still held become due again when their lease runs out."""
+        queue = deque(deliveries)
+        try:
+            while queue:
+                delivery = queue.popleft()
+                async with self._send_slots:
+                    moment = clock()
+                    result = await self._send(client, delivery, moment)
+                self._record(delivery.id, result, moment)
+        except Exception as exc:
+            logger.exception("lane for endpoint %s failed", deliveries[0].endpoint_id)
+            self.stats.errors = (self.stats.errors + [repr(exc)])[-10:]
+
     def claim_statement(self, now: datetime) -> Select[tuple[Delivery]]:
         """Due work: pending deliveries whose time has come, plus deliveries still marked
         `delivering` whose claim lease has expired (their worker died mid-batch).
