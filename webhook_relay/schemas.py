@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -29,12 +29,30 @@ def clean_filters(value: list[str] | None) -> list[str] | None:
     return cleaned
 
 
+MaxRps = Annotated[
+    float,
+    Field(
+        gt=0,
+        le=10_000,
+        allow_inf_nan=False,
+        description="Sustained requests per second across all workers; fractions allowed. "
+        "Bursts of up to one second's worth are let through.",
+    ),
+]
+MaxInFlight = Annotated[
+    int,
+    Field(ge=1, le=10_000, description="Requests open at once across all workers."),
+]
+
+
 class EndpointCreate(BaseModel):
     url: HttpUrl
     secret: str | None = Field(default=None, min_length=16, max_length=128)
     description: str | None = Field(default=None, max_length=500)
     event_types: list[str] = Field(default_factory=list, max_length=50)
     is_active: bool = True
+    max_rps: MaxRps | None = None
+    max_in_flight: MaxInFlight | None = None
 
     @field_validator("event_types")
     @classmethod
@@ -48,6 +66,10 @@ class EndpointUpdate(BaseModel):
     event_types: list[str] | None = Field(default=None, max_length=50)
     is_active: bool | None = None
     rotate_secret: bool = False
+    max_rps: MaxRps | None = Field(default=None, description="Send null to remove the limit.")
+    max_in_flight: MaxInFlight | None = Field(
+        default=None, description="Send null to remove the limit."
+    )
 
     @field_validator("event_types")
     @classmethod
@@ -61,6 +83,8 @@ class EndpointOut(BaseModel):
     description: str | None
     event_types: list[str]
     is_active: bool
+    max_rps: float | None
+    max_in_flight: int | None
     circuit_state: str
     consecutive_failures: int
     circuit_opened_at: datetime | None
@@ -75,6 +99,8 @@ class EndpointOut(BaseModel):
             description=ep.description,
             event_types=list(ep.event_types or []),
             is_active=ep.is_active,
+            max_rps=ep.max_rps,
+            max_in_flight=ep.max_in_flight,
             circuit_state=ep.circuit_state,
             consecutive_failures=ep.consecutive_failures,
             circuit_opened_at=as_utc(ep.circuit_opened_at),
