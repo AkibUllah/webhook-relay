@@ -29,7 +29,7 @@ from webhook_relay.config import Settings
 from webhook_relay.core.backoff import next_attempt_at
 from webhook_relay.core.circuit import Circuit, CircuitState
 from webhook_relay.core.signing import SIGNATURE_HEADER, build_signature_header
-from webhook_relay.models import Delivery, Endpoint, Event, as_utc, utc_now
+from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event, as_utc, utc_now
 from webhook_relay.services.retention import PurgeResult, RetentionService
 
 logger = logging.getLogger(__name__)
@@ -82,6 +82,18 @@ class WorkerStats:
             },
             "worker_id": self.worker_id,
         }
+
+
+@dataclass(frozen=True)
+class SendResult:
+    """What came back from one HTTP attempt, ready to be recorded."""
+
+    attempt_number: int
+    ok: bool
+    status_code: int | None
+    excerpt: str | None
+    error: str | None
+    duration_ms: int
 
 
 def build_payload(event: Event, delivery: Delivery, attempt: int) -> bytes:
@@ -166,15 +178,15 @@ class Dispatcher:
         self.stats.last_run_at = now
         with self._sessions() as db:
             due = self._claim_due(db, now)
-            if not due:
-                return 0
-            async with httpx.AsyncClient(
-                timeout=self.settings.http_timeout_seconds, transport=self._transport
-            ) as client:
-                for delivery in due:
-                    await self._dispatch(db, client, delivery, now)
-                    db.commit()
-            return len(due)
+        if not due:
+            return 0
+        async with httpx.AsyncClient(
+            timeout=self.settings.http_timeout_seconds, transport=self._transport
+        ) as client:
+            for delivery in due:
+                result = await self._send(client, delivery, now)
+                self._record(delivery.id, result, now)
+        return len(due)
 
     async def maybe_purge(self, now: datetime | None = None) -> PurgeResult | None:
         """Apply retention if it is enabled and RETENTION_INTERVAL_SECONDS have passed since the
@@ -247,9 +259,11 @@ class Dispatcher:
         db.commit()
         return claimed
 
-    async def _dispatch(
-        self, db: Session, client: httpx.AsyncClient, delivery: Delivery, now: datetime
-    ) -> None:
+    async def _send(
+        self, client: httpx.AsyncClient, delivery: Delivery, now: datetime
+    ) -> SendResult:
+        """One HTTP attempt. Touches no database session, so no connection is held while a
+        receiver takes its time to answer."""
         endpoint = delivery.endpoint
         attempt_number = delivery.attempt_count + 1
         body = build_payload(delivery.event, delivery, attempt_number)
@@ -279,17 +293,42 @@ class Dispatcher:
             ok = False
             error = f"{type(exc).__name__}: {exc}"[:500]
         duration_ms = int((time.perf_counter() - started) * 1000)
+        return SendResult(attempt_number, ok, status_code, excerpt, error, duration_ms)
 
-        from webhook_relay.models import DeliveryAttempt
+    def _record(self, delivery_id: str, result: SendResult, now: datetime) -> None:
+        """Store an attempt and its consequences in a short transaction of its own. The endpoint
+        row is locked (without blocking event inserts) so concurrent outcomes for one endpoint
+        update the breaker one at a time instead of overwriting each other."""
+        with self._sessions() as db:
+            delivery = db.get(Delivery, delivery_id)
+            if delivery is None:
+                return
+            endpoint = db.scalar(
+                select(Endpoint)
+                .where(Endpoint.id == delivery.endpoint_id)
+                .with_for_update(key_share=True)
+            )
+            self._apply_result(db, delivery, endpoint, result, now)
+            db.commit()
 
+    def _apply_result(
+        self,
+        db: Session,
+        delivery: Delivery,
+        endpoint: Endpoint,
+        result: SendResult,
+        now: datetime,
+    ) -> None:
+        attempt_number, ok = result.attempt_number, result.ok
+        status_code, error = result.status_code, result.error
         db.add(
             DeliveryAttempt(
                 delivery_id=delivery.id,
                 attempt_number=attempt_number,
                 status_code=status_code,
-                response_excerpt=excerpt,
+                response_excerpt=result.excerpt,
                 error=error,
-                duration_ms=duration_ms,
+                duration_ms=result.duration_ms,
                 succeeded=ok,
                 created_at=now,
             )
@@ -309,7 +348,11 @@ class Dispatcher:
             circuit_to(endpoint, circuit.record_success())
             self.stats.succeeded += 1
             logger.info(
-                "delivered %s -> %s (%s, %sms)", delivery.id, endpoint.url, status_code, duration_ms
+                "delivered %s -> %s (%s, %sms)",
+                delivery.id,
+                endpoint.url,
+                status_code,
+                result.duration_ms,
             )
             return
 
