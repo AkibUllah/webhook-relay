@@ -97,3 +97,81 @@ async def test_a_crashing_lane_leaves_the_others_running(app, client, auth, disp
     with app.state.session_factory() as db:
         statuses = sorted(db.scalars(select(Delivery.status)).all())
     assert statuses == ["delivering", "succeeded"]  # recovered when the lease expires
+
+
+def _worker(app, settings, probe, **overrides) -> Dispatcher:
+    return Dispatcher(
+        app.state.session_factory,
+        settings.model_copy(update={"poll_interval_seconds": 0.01, **overrides}),
+        transport=httpx.MockTransport(probe),
+        clock=app.state.clock,
+    )
+
+
+async def test_worker_keeps_claiming_while_a_slow_lane_runs(app, client, auth, settings):
+    probe = Probe()
+    probe.gates["/slow"] = asyncio.Event()
+    worker = _worker(app, settings, probe)
+    register(client, auth, path="/slow", event_types=["slow.*"])
+    register(client, auth, path="/fast", event_types=["fast.*"])
+    publish(client, auth, type="slow.first")
+    publish(client, auth, type="slow.second")
+
+    loop = asyncio.create_task(worker.run_forever())
+    while probe.open == 0:
+        await asyncio.sleep(0.001)
+
+    # New work for another endpoint arrives while /slow sits on its first two requests.
+    publish(client, auth, type="fast.ping")
+    await asyncio.wait_for(_arrival(probe, "/fast"), timeout=2)
+    assert probe.paths == ["/fast"]
+
+    probe.gates["/slow"].set()
+    await asyncio.wait_for(_arrival(probe, "/slow", count=2), timeout=2)
+    worker.stop()
+    await asyncio.wait_for(loop, timeout=2)
+    assert probe.peak == 2  # one per endpoint: /slow never got a second lane in this worker
+
+
+async def _arrival(probe: Probe, path: str, count: int = 1) -> None:
+    while probe.paths.count(path) < count:
+        await asyncio.sleep(0.001)
+
+
+async def test_shutdown_hands_back_deliveries_a_lane_never_sent(app, client, auth, settings):
+    probe = Probe()
+    probe.gates["/hooks"] = asyncio.Event()
+    worker = _worker(app, settings, probe)
+    register(client, auth)
+    for _ in range(3):
+        publish(client, auth)
+
+    loop = asyncio.create_task(worker.run_forever())
+    while probe.open == 0:
+        await asyncio.sleep(0.001)
+    worker.stop()
+    probe.gates["/hooks"].set()
+    await asyncio.wait_for(loop, timeout=2)
+
+    assert probe.paths == ["/hooks"]  # the request already on the wire finished
+    with app.state.session_factory() as db:
+        rows = list(db.scalars(select(Delivery)).all())
+    unsent = [d for d in rows if d.status == "pending"]
+    assert len(unsent) == 2
+    assert all(d.attempt_count == 0 and d.claimed_by is None for d in unsent)
+
+
+async def test_cancelling_the_worker_stops_its_lanes(app, client, auth, settings):
+    probe = Probe()
+    probe.gates["/hooks"] = asyncio.Event()
+    worker = _worker(app, settings, probe)
+    register(client, auth)
+    publish(client, auth)
+
+    loop = asyncio.create_task(worker.run_forever())
+    while probe.open == 0:
+        await asyncio.sleep(0.001)
+    loop.cancel()
+    await asyncio.wait([loop], timeout=2)
+    assert loop.cancelled()
+    assert probe.open == 0 and worker._lanes == {}
