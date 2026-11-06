@@ -242,6 +242,7 @@ class MetricsOut(BaseModel):
     endpoints_total: int
     endpoints_active: int
     endpoints_circuit_open: int
+    endpoints_limited: int
     deliveries_by_status: dict[str, int]
     attempts_total: int
     attempts_succeeded: int
