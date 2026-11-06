@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from webhook_relay.models import Delivery, DeliveryAttempt, Endpoint, Event
@@ -41,6 +41,14 @@ def collect_metrics(db: Session, worker: WorkerStats, now: datetime) -> dict:
         ),
         "endpoints_circuit_open": int(
             db.scalar(select(func.count(Endpoint.id)).where(Endpoint.circuit_state == "open")) or 0
+        ),
+        "endpoints_limited": int(
+            db.scalar(
+                select(func.count(Endpoint.id)).where(
+                    or_(Endpoint.max_rps.is_not(None), Endpoint.max_in_flight.is_not(None))
+                )
+            )
+            or 0
         ),
         "deliveries_by_status": {
             s: by_status.get(s, 0) for s in ("pending", "delivering", "succeeded", "dead")

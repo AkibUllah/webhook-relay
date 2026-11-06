@@ -318,3 +318,14 @@ async def test_worker_wakes_for_a_rate_limit_sooner_than_the_poll_interval(
     await asyncio.wait_for(all_sent(), timeout=5)
     worker.stop()
     await asyncio.wait_for(loop, timeout=2)
+
+
+def test_dashboard_and_metrics_show_endpoint_limits(client, auth):
+    register(client, auth, path="/both", max_rps=2.5, max_in_flight=4)
+    register(client, auth, path="/rate", max_rps=1)
+    register(client, auth, path="/none")
+
+    assert client.get("/metrics").json()["endpoints_limited"] == 2
+    page = client.get("/dashboard").text
+    assert "2.5/s · 4 in flight" in page
+    assert "Held by rate limit" in page

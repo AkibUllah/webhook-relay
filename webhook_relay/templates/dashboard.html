@@ -37,23 +37,30 @@
     <div class="card"><span class="muted">Dead letters</span><b>{{ metrics.dead_letters }}</b></div>
     <div class="card"><span class="muted">Success rate</span><b>{{ (metrics.success_rate * 100) | round(1) }}%</b></div>
     <div class="card"><span class="muted">Circuits open</span><b>{{ metrics.endpoints_circuit_open }}</b></div>
+    <div class="card"><span class="muted">Held by rate limit</span><b>{{ metrics.worker.skipped_rate_limited }}</b></div>
   </div>
 
   <h2>Endpoints</h2>
   <table>
-    <thead><tr><th>ID</th><th>URL</th><th>Filters</th><th>Circuit</th><th>Failures</th><th>Active</th></tr></thead>
+    <thead><tr><th>ID</th><th>URL</th><th>Filters</th><th>Limits</th><th>Circuit</th><th>Failures</th><th>Active</th></tr></thead>
     <tbody>
     {% for ep in endpoints %}
       <tr class="{{ '' if ep.is_active else 'inactive' }}">
         <td><code>{{ ep.id }}</code></td>
         <td>{{ ep.url }}<br><span class="muted">{{ ep.description or "" }}</span></td>
         <td>{% if ep.event_types %}{{ ep.event_types | join(", ") }}{% else %}<span class="muted">all events</span>{% endif %}</td>
+        <td>
+          {%- if ep.max_rps is not none %}{{ "%g" | format(ep.max_rps) }}/s{% endif %}
+          {%- if ep.max_rps is not none and ep.max_in_flight is not none %} · {% endif %}
+          {%- if ep.max_in_flight is not none %}{{ ep.max_in_flight }} in flight{% endif %}
+          {%- if ep.max_rps is none and ep.max_in_flight is none %}<span class="muted">none</span>{% endif -%}
+        </td>
         <td><span class="tag {{ ep.circuit_state }}">{{ ep.circuit_state }}</span></td>
         <td>{{ ep.consecutive_failures }}</td>
         <td>{{ "yes" if ep.is_active else "no" }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="6" class="muted">No endpoints registered. POST /v1/endpoints to add one.</td></tr>
+      <tr><td colspan="7" class="muted">No endpoints registered. POST /v1/endpoints to add one.</td></tr>
     {% endfor %}
     </tbody>
   </table>
